@@ -112,8 +112,17 @@ func (h *MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	startTime := time.Now()
 
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(model.Timeout)*time.Second)
+	// model.Timeout guards connect/headers and non-streaming bodies.
+	// Streaming requests disarm it up front: the stream flag is in the
+	// request here (unlike the passthrough proxy, which must sniff the
+	// response Content-Type), and a wall-clock cap on a live stream
+	// severs healthy long generations (see requestTimeout). Pre-stream
+	// phases stay bounded by the transport's dial/TLS/header timeouts.
+	ctx, cancel, disarmTimeout := requestTimeout(r.Context(), model.Timeout)
 	defer cancel()
+	if req.Stream {
+		disarmTimeout()
+	}
 
 	// AWS Bedrock backends use the Converse API (translated from Anthropic
 	// Messages, signed with SigV4 or a Bedrock API key) instead of Chat
