@@ -115,6 +115,9 @@ func main() {
 
 	// Start health checker for model availability tracking.
 	healthStore := config.NewHealthStore(cs, 30*time.Second, 5*time.Second)
+	// Let the usage-logging funnel update backend health from real request
+	// outcomes (esp. external backends, which are otherwise probed only once).
+	handler.SetHealthStore(healthStore)
 
 	// Create the processing pipeline (shared by all handlers).
 	pl := pipeline.NewPipeline(cs, httputil.NewHTTPClient())
@@ -133,6 +136,9 @@ func main() {
 	cs.SetOnReload(func(newCfg *config.Config) {
 		rl.SetTrustedProxies(newCfg.TrustedProxies)
 		healthStore.RefreshFromConfig()
+		// Re-probe all backends so a changed key/backend reflects immediately,
+		// instead of showing status frozen from the last process start.
+		healthStore.RecheckAll()
 		if dashRl != nil {
 			dashRl.SetTrustedProxies(newCfg.TrustedProxies)
 		}

@@ -99,6 +99,20 @@ func isExternalBackend(backendURL string) bool {
 	return true
 }
 
+// RecheckAll triggers a one-shot health probe of ALL backends, including
+// external ones. Call it after a config reload so that changed backends/keys
+// are re-evaluated immediately instead of showing a status frozen from the
+// last process start. Probes run asynchronously; the call does not block.
+func (hs *HealthStore) RecheckAll() {
+	client := &http.Client{
+		Timeout: hs.checkTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	hs.checkAllInitial(context.Background(), client)
+}
+
 // RefreshFromConfig syncs the health map after a config reload.
 func (hs *HealthStore) RefreshFromConfig() {
 	cfg := hs.config.Get()
