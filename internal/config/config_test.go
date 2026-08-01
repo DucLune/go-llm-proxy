@@ -217,6 +217,34 @@ func TestValidateConfig_UnknownMessagesMode(t *testing.T) {
 	}
 }
 
+func TestValidateConfig_MessagesModeTranslateWithAnthropicType(t *testing.T) {
+	cfg := validConfig()
+	cfg.Models[0].Type = BackendAnthropic
+	cfg.Models[0].MessagesMode = MessagesModeTranslate
+	err := validateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "incompatible with type") {
+		t.Fatalf("expected messages_mode translate + anthropic type error, got: %v", err)
+	}
+}
+
+func TestValidateConfig_MessagesModeTranslateWithOpenAIType(t *testing.T) {
+	cfg := validConfig()
+	cfg.Models[0].Type = BackendOpenAI
+	cfg.Models[0].MessagesMode = MessagesModeTranslate
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("expected no error for messages_mode translate with openai type, got: %v", err)
+	}
+}
+
+func TestValidateConfig_MessagesModeNativeWithAnthropicType(t *testing.T) {
+	cfg := validConfig()
+	cfg.Models[0].Type = BackendAnthropic
+	cfg.Models[0].MessagesMode = MessagesModeNative
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("expected no error for messages_mode native with anthropic type, got: %v", err)
+	}
+}
+
 func TestValidateConfig_DashboardRequiresMetrics(t *testing.T) {
 	cfg := validConfig()
 	cfg.UsageDashboard = true

@@ -384,9 +384,14 @@ func (p *ProxyHandler) handleNonStreamingWithSearch(w http.ResponseWriter, resp 
 			}, 5)
 		if err != nil {
 			slog.Error("proxy search loop failed", "model", rc.modelName, "error", err)
-		} else {
-			chatResp = *finalResp
+			// Do not forward the original tool_call response to the client —
+			// it contains a web_search call the client has no way to execute,
+			// leaving it in a dead loop. Surface an explicit error instead,
+			// mirroring the messages handler's behavior.
+			httputil.WriteError(w, http.StatusBadGateway, "web search failed")
+			return
 		}
+		chatResp = *finalResp
 	}
 
 	// Filter think tags from content.

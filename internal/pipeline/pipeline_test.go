@@ -578,6 +578,121 @@ func TestProcessImages_VisionModelFailure(t *testing.T) {
 	}
 }
 
+// --- Vision circuit breaker tests ---
+
+// breakerVisionModel returns a vision ModelConfig pointing at a backend that
+// always fails (HTTP 500), for tripping the breaker.
+func breakerVisionModel(t *testing.T) (*config.ModelConfig, *httptest.Server) {
+	t.Helper()
+	srv := mockImageServer(t, "err", "", nil)
+	return &config.ModelConfig{Name: "breaker-vision", Backend: srv.URL, Model: "breaker-vision"}, srv
+}
+
+func TestVisionBreaker_OpensAfterFailures(t *testing.T) {
+	ResetVisionBreaker()
+	defer ResetVisionBreaker()
+	ResetImageCache()
+
+	visionModel, srv := breakerVisionModel(t)
+	defer srv.Close()
+	p := &Pipeline{client: http.DefaultClient}
+
+	// Saturate failures past the threshold (no success in between).
+	// Note: processImages replaces failed images with placeholder text in the
+	// passed map, so a fresh request must be built per iteration — reusing one
+	// map would leave no image to process on later calls and the breaker would
+	// never accumulate failures.
+	for i := 0; i < visionBreakerThreshold; i++ {
+		_, err := p.processImages(context.Background(), breakerReq(), visionModel, nil, 0, 0)
+		if err != nil {
+			t.Fatalf("processImages iteration %d error: %v", i, err)
+		}
+	}
+
+	// Once open, Allow must return false (short-circuit).
+	if visionBreaker.Allow() {
+		t.Fatal("expected breaker to be open after threshold failures, but Allow() returned true")
+	}
+}
+
+func TestVisionBreaker_CooldownAllowsProbe(t *testing.T) {
+	ResetVisionBreaker()
+	defer ResetVisionBreaker()
+
+	// Force the breaker open with a past cooldown so the probe window has passed.
+	visionBreaker.mu.Lock()
+	visionBreaker.failures = visionBreakerThreshold
+	visionBreaker.openUntil = time.Now().Add(-time.Second)
+	visionBreaker.mu.Unlock()
+
+	// Cooldown elapsed → Allow() should half-open and permit a probe.
+	if !visionBreaker.Allow() {
+		t.Fatal("expected Allow() to return true after cooldown elapsed (half-open probe)")
+	}
+}
+
+func TestVisionBreaker_OpenCausesPlaceholder(t *testing.T) {
+	ResetVisionBreaker()
+	defer ResetVisionBreaker()
+	ResetImageCache()
+
+	// Force the breaker open with a future cooldown so probes are blocked.
+	visionBreaker.mu.Lock()
+	visionBreaker.failures = visionBreakerThreshold
+	visionBreaker.openUntil = time.Now().Add(time.Hour)
+	visionBreaker.mu.Unlock()
+
+	visionModel, srv := breakerVisionModel(t)
+	defer srv.Close()
+	p := &Pipeline{client: http.DefaultClient}
+
+	result, err := p.processImages(context.Background(), breakerReq(), visionModel, nil, 0, 0)
+	if err != nil {
+		t.Fatalf("processImages error: %v", err)
+	}
+	msgs := result["messages"].([]any)
+	content := msgs[0].(map[string]any)["content"].([]any)
+	text := content[0].(map[string]any)["text"].(string)
+	if text != "[Image could not be processed]" {
+		t.Fatalf("expected placeholder when breaker is open, got: %s", text)
+	}
+}
+
+func TestVisionBreaker_SuccessCloses(t *testing.T) {
+	ResetVisionBreaker()
+	defer ResetVisionBreaker()
+
+	// Force the breaker open.
+	visionBreaker.mu.Lock()
+	visionBreaker.failures = visionBreakerThreshold
+	visionBreaker.openUntil = time.Now().Add(time.Hour)
+	visionBreaker.mu.Unlock()
+
+	// A success closes it.
+	visionBreaker.Success()
+	if !visionBreaker.Allow() {
+		t.Fatal("expected Allow() to return true after a success closed the breaker")
+	}
+}
+
+// breakerReq returns a chat request with one user image that processImages
+// will attempt to send to the vision model.
+func breakerReq() map[string]any {
+	return map[string]any{
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type":      "image_url",
+						"image_url": map[string]any{"url": "data:image/png;base64,breaker-image"},
+					},
+				},
+			},
+		},
+	}
+}
+
 // --- Tool-role image cascade (OCR → vision) tests ---
 
 // mockImageServer returns a handler that counts hits and produces either a

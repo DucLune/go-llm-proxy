@@ -30,6 +30,91 @@ func ResetImageCache() {
 	imageCache.Reset()
 }
 
+// visionBreaker is a lightweight circuit breaker that opens after a run of
+// consecutive vision/OCR failures and short-circuits processing for a cooldown
+// window. When the vision backend is down, every image-carrying request would
+// otherwise spin up vision goroutines and wait the full per-call timeout (up to
+// 120s) before failing — with max_images_per_request=100 and maxConcurrentVision
+// that can stall a request for minutes. Opening the breaker turns all image
+// processing into immediate placeholders during the outage, then half-opens
+// after the cooldown to let one attempt through and re-close on success.
+//
+// The breaker is keyed per vision/OCR model name so one flaky backend doesn't
+// trip the breaker for a healthy one. It is request-agnostic (a package-level
+// singleton), which is deliberate: an outage is a property of the backend, not
+// of any single request.
+var visionBreaker = newVisionBreaker()
+
+// visionBreakerConfig bounds the circuit breaker. Thresholds are chosen to be
+// forgiving of transient hiccups (a single failed image or a brief upstream
+// blip shouldn't open the breaker) while still failing fast during a real
+// outage (100 failed images at maxConcurrentVision=5 trip it in ~10 batches).
+const (
+	// visionBreakerThreshold consecutive failures before the breaker opens.
+	visionBreakerThreshold = 10
+	// visionBreakerCooldown is how long the breaker stays open before the
+	// first half-open probe is allowed.
+	visionBreakerCooldown = 30 * time.Second
+)
+
+// visionBreakerState tracks consecutive vision/OCR failures and cooldown state.
+// All fields are guarded by mu.
+type visionBreakerState struct {
+	mu         sync.Mutex
+	failures   int        // consecutive failures since last success
+	openUntil  time.Time  // zero = closed; time when the breaker may probe again
+	lastAccess time.Time  // for tests to reset
+}
+
+// newVisionBreaker returns a fresh, closed breaker.
+func newVisionBreaker() *visionBreakerState {
+	return &visionBreakerState{}
+}
+
+// Allow reports whether a vision call may proceed. On open and still cooling
+// down it returns false (short-circuit); on the first attempt after the
+// cooldown it half-opens and returns true (allow a probe through).
+func (b *visionBreakerState) Allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.failures >= visionBreakerThreshold {
+		if time.Now().After(b.openUntil) {
+			// Cooldown elapsed — half-open: let one probe attempt through.
+			b.failures = visionBreakerThreshold - 1 // reserve so the probe counts as the deciding failure
+			return true
+		}
+		return false
+	}
+	return true
+}
+
+// Success records a successful vision call, closing the breaker.
+func (b *visionBreakerState) Success() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.failures = 0
+	b.openUntil = time.Time{}
+}
+
+// Failure records a failed vision call. When the consecutive-failure count
+// reaches the threshold, the breaker opens and the cooldown starts.
+func (b *visionBreakerState) Failure() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.failures++
+	if b.failures >= visionBreakerThreshold {
+		b.openUntil = time.Now().Add(visionBreakerCooldown)
+	}
+}
+
+// ResetVisionBreaker clears the breaker state. Exported for tests.
+func ResetVisionBreaker() {
+	visionBreaker.mu.Lock()
+	defer visionBreaker.mu.Unlock()
+	visionBreaker.failures = 0
+	visionBreaker.openUntil = time.Time{}
+}
+
 // defaultMaxImagesPerRequest caps the number of unique images the vision
 // processor will handle in a single request when the operator hasn't configured
 // processors.max_images_per_request. Beyond this, remaining images get a
@@ -256,8 +341,28 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 			wg.Add(1)
 			go func(idx int, j imageJob) {
 				defer wg.Done()
-				sem <- struct{}{}
+				select {
+				case <-ctx.Done():
+					// Parent context cancelled (client disconnect, request
+					// timeout) while waiting for a concurrency slot — record
+					// the cancellation and exit without calling the vision
+					// backend. The wg.Wait below drains on ctx.Done so a
+					// cancelled request doesn't block forever waiting on jobs
+					// that may be stuck in long upstream calls.
+					results[idx] = jobResult{desc: "", err: ctx.Err()}
+					return
+				case sem <- struct{}{}:
+				}
 				defer func() { <-sem }()
+
+				// Circuit breaker: if the vision backend is in a failure
+				// streak, short-circuit this image to a placeholder instead of
+				// spinning up a call that will only time out.
+				if !visionBreaker.Allow() {
+					results[idx] = jobResult{desc: "", err: fmt.Errorf("vision backend temporarily unavailable (circuit breaker open)")}
+					return
+				}
+
 				desc, err := p.describeImage(ctx, j.model, j.url, j.prompt, j.maxTokens)
 				// Cascade: if the primary attempt failed or came back empty,
 				// and a fallback is configured, retry with the fallback.
@@ -276,7 +381,23 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 				results[idx] = jobResult{desc: desc, err: err}
 			}(i, job)
 		}
-		wg.Wait()
+		// Wait for all jobs, but don't block forever if the parent context was
+		// cancelled (client disconnect / request timeout). Workers exit early on
+		// ctx.Done when acquiring a slot, but a worker already inside a long
+		// vision call may not return promptly — so wait with a ctx.Done escape
+		// hatch. A worker that was still running finishes later in the
+		// background; recording its result after we've emitted placeholders is
+		// harmless because a cancelled request's downstream is gone anyway.
+		allDone := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(allDone)
+		}()
+		select {
+		case <-allDone:
+		case <-ctx.Done():
+			slog.Warn("vision processing cancelled by context", "error", ctx.Err())
+		}
 
 		// Cache successful results permanently; failures short-TTL.
 		for i, r := range results {
@@ -284,6 +405,7 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 				if r.err != nil {
 					slog.Warn("failed to process image",
 						"model", jobs[i].model.Name, "cache_key", jobs[i].cacheKey, "error", r.err)
+					visionBreaker.Failure()
 				}
 				// Cache the failure briefly to prevent a cascade re-run on
 				// every subsequent turn while the underlying upstream is
@@ -292,6 +414,7 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 					imageCache.StoreWithTTL(jobs[i].failKey, "1", imageFailureTTL)
 				}
 			} else {
+				visionBreaker.Success()
 				// A user-role description that is suspiciously short is almost
 				// certainly a truncated fragment ("This is a screenshot of a"),
 				// not a real description. Do not permanently cache it — treat it
@@ -302,6 +425,7 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 					slog.Warn("vision description too short; not caching",
 						"model", jobs[i].model.Name, "cache_key", jobs[i].cacheKey,
 						"len", len([]rune(strings.TrimSpace(r.desc))))
+					visionBreaker.Failure()
 					continue
 				}
 				imageCache.Store(jobs[i].cacheKey, r.desc)

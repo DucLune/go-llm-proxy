@@ -393,6 +393,15 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf("model %q has unknown messages_mode %q (must be %q, %q, or omitted)", m.Name, m.MessagesMode, MessagesModeNative, MessagesModeTranslate)
 		}
 
+		// messages_mode: translate is incompatible with type: anthropic. A
+		// translation forces the request to model.Backend + /v1/chat/completions;
+		// an Anthropic backend (e.g. api.anthropic.com) has no such endpoint, so
+		// the combination fails at runtime with an opaque 404. Catch it at load
+		// time instead.
+		if m.MessagesMode == MessagesModeTranslate && m.Type == BackendAnthropic {
+			return fmt.Errorf("model %q: messages_mode %q is incompatible with type %q (an anthropic backend has no /v1/chat/completions endpoint)", m.Name, MessagesModeTranslate, BackendAnthropic)
+		}
+
 		if d := m.Defaults; d != nil && d.ReasoningEffort != nil {
 			switch *d.ReasoningEffort {
 			case "low", "medium", "high":

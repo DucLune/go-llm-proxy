@@ -181,6 +181,18 @@ func translateUserMessage(content json.RawMessage) []map[string]any {
 	// follow the assistant tool_calls message immediately. Claude Code merges
 	// text and tool_result blocks into a single user message, so emit the tool
 	// results BEFORE the text parts to keep the tool_calls -> tool adjacency.
+	//
+	// Trade-off: the translated order (tool results first, then user text)
+	// diverges from the original Anthropic order (text then tool_result). For
+	// DeepSeek and most OpenAI-compatible backends this reordering is what makes
+	// the request valid at all — an interleaved [text, tool] sequence would be
+	// rejected with "tool messages must follow assistant tool_calls". The
+	// reordering is semantically lossless for the model: tool results are
+	// associated with their tool_call_id, and the user text that follows still
+	// reads as the current turn's instruction. Backends that are strictly
+	// order-sensitive may interpret the context slightly differently, but that
+	// is a reasonable price for compatibility with the majority of OpenAI
+	// endpoints. Keep this ordering; do not revert without a compatibility knob.
 	result = append(result, toolResults...)
 
 	// Emit user message after the tool results.
