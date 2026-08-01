@@ -177,7 +177,13 @@ func translateUserMessage(content json.RawMessage) []map[string]any {
 
 	var result []map[string]any
 
-	// Emit user message if there are any text/image parts.
+	// OpenAI-compatible backends (DeepSeek, etc.) require role:tool messages to
+	// follow the assistant tool_calls message immediately. Claude Code merges
+	// text and tool_result blocks into a single user message, so emit the tool
+	// results BEFORE the text parts to keep the tool_calls -> tool adjacency.
+	result = append(result, toolResults...)
+
+	// Emit user message after the tool results.
 	if len(userParts) > 0 {
 		// If only one text part, simplify to string content.
 		if len(userParts) == 1 {
@@ -190,9 +196,6 @@ func translateUserMessage(content json.RawMessage) []map[string]any {
 			result = append(result, map[string]any{"role": "user", "content": userParts})
 		}
 	}
-
-	// Emit tool result messages after the user message.
-	result = append(result, toolResults...)
 
 	return result
 }
@@ -215,6 +218,7 @@ func translateAssistantMessage(content json.RawMessage) map[string]any {
 
 	var textParts []string
 	var toolCalls []map[string]any
+	var reasoningParts []string
 
 	for _, block := range blocks {
 		var blockType string
@@ -263,7 +267,15 @@ func translateAssistantMessage(content json.RawMessage) map[string]any {
 			}
 
 		case "thinking", "redacted_thinking":
-			slog.Debug("stripping thinking block from assistant message", "type", blockType)
+			// DeepSeek thinking mode requires the assistant's reasoning_content to
+			// be passed back verbatim when tool calls are replayed. The thinking
+			// block text is exactly that reasoning, so carry it into the translated
+			// message instead of dropping it (redacted blocks have no readable text).
+			var thinking string
+			if json.Unmarshal(block["thinking"], &thinking) == nil && thinking != "" {
+				reasoningParts = append(reasoningParts, thinking)
+			}
+			slog.Debug("translating thinking block from assistant message", "type", blockType, "has_text", len(thinking) > 0)
 
 		default:
 			slog.Debug("skipping unknown assistant content block type", "type", blockType)
@@ -272,11 +284,19 @@ func translateAssistantMessage(content json.RawMessage) map[string]any {
 
 	msg := map[string]any{"role": "assistant"}
 
+	reasoning := strings.Join(reasoningParts, "")
+	if reasoning != "" {
+		msg["reasoning_content"] = reasoning
+	}
+
 	text := strings.Join(textParts, "")
 	if text != "" {
 		msg["content"] = text
 	} else {
-		msg["content"] = nil
+		// Use empty string (not null): some OpenAI-compatible backends reject
+		// null content on assistant messages, and DeepSeek requires it alongside
+		// reasoning_content/tool_calls.
+		msg["content"] = ""
 	}
 
 	if len(toolCalls) > 0 {

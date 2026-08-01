@@ -12,3 +12,12 @@ qwen-code-main/
 opencode-dev/
 rtx6kpro/
 .gitignore
+
+# Runtime artifacts (never commit)
+go-llm-proxy.exe
+go-llm-proxy.exe~
+proxy.log
+proxy-*.log.gz
+startup_test.log
+usage.db
+usage.db-*

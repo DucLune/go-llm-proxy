@@ -75,6 +75,8 @@ models:
 #   vision: my-vision-model          # model name from above (must support vision)
 #   ocr: my-fast-ocr-model           # optional: fast model for PDF page text extraction (falls back to vision)
 #   web_search_key: tvly-...         # Tavily API key — enables proxy-side web search
+#   vision_max_tokens: 1000          # optional: cap description length (0 = built-in 1000/2000 per role)
+#   max_images_per_request: 10       # optional: max unique images processed per request (0 = built-in default 10)
 
 # ── API Keys ───────────────────────────────────────────────────────────────────
 # Clients authenticate with these keys via Authorization: Bearer or x-api-key.

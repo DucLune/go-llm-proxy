@@ -4,12 +4,15 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"gopkg.in/natefinch/lumberjack.v2"
 
 	"go-llm-proxy/internal/auth"
 	"go-llm-proxy/internal/config"
@@ -75,21 +78,60 @@ func main() {
 		return
 	}
 
-	logLevel := slog.LevelInfo
-	if *logDebug {
-		logLevel = slog.LevelDebug
-	}
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: logLevel,
-	})))
-
 	cs, err := config.NewConfigStore(*configPath)
 	if err != nil {
-		slog.Error("failed to load config", "error", err)
+		fmt.Fprintln(os.Stderr, "failed to load config:", err)
 		os.Exit(1)
 	}
 
 	cfg := cs.Get()
+
+	// Resolve the effective log level: the -log-debug CLI flag takes precedence
+	// over config, and config (log.level: debug) overrides the default info.
+	logLevel := slog.LevelInfo
+	if cfg.Log.LogLevel() == slog.LevelDebug {
+		logLevel = slog.LevelDebug
+	}
+	if *logDebug {
+		logLevel = slog.LevelDebug
+	}
+
+	// Build the log destination. When log.file is set, slog writes to that file
+	// (lumberjack size-rotated) AND stdout — file enables persistence for hidden
+	// launches, stdout keeps foreground visibility. Otherwise stdout only.
+	var logWriters []io.Writer
+	logWriters = append(logWriters, os.Stdout)
+	if cfg.Log.File != "" {
+		maxSize := cfg.Log.MaxSizeMB
+		if maxSize <= 0 {
+			maxSize = 10
+		}
+		maxBackups := cfg.Log.MaxBackups
+		if maxBackups < 0 {
+			maxBackups = 0
+		} else if maxBackups == 0 {
+			maxBackups = 5
+		}
+		compress := true
+		if cfg.Log.Compress != nil {
+			compress = *cfg.Log.Compress
+		}
+		logWriters = append(logWriters, &lumberjack.Logger{
+			Filename:   cfg.Log.File,
+			MaxSize:    maxSize,
+			MaxBackups: maxBackups,
+			MaxAge:     0, // no age-based purge; size/backup limits suffice
+			Compress:   compress,
+			LocalTime:  true,
+		})
+	}
+	multi := io.MultiWriter(logWriters...)
+	slog.SetDefault(slog.New(slog.NewJSONHandler(multi, &slog.HandlerOptions{
+		Level: logLevel,
+	})))
+	if cfg.Log.File != "" {
+		slog.Info("file logging enabled", "file", cfg.Log.File, "level", logLevel.String())
+	}
 
 	// Initialize usage logger if enabled via CLI flag or config.
 	var ul *usage.UsageLogger
@@ -115,9 +157,6 @@ func main() {
 
 	// Start health checker for model availability tracking.
 	healthStore := config.NewHealthStore(cs, 30*time.Second, 5*time.Second)
-	// Let the usage-logging funnel update backend health from real request
-	// outcomes (esp. external backends, which are otherwise probed only once).
-	handler.SetHealthStore(healthStore)
 
 	// Create the processing pipeline (shared by all handlers).
 	pl := pipeline.NewPipeline(cs, httputil.NewHTTPClient())
@@ -136,9 +175,6 @@ func main() {
 	cs.SetOnReload(func(newCfg *config.Config) {
 		rl.SetTrustedProxies(newCfg.TrustedProxies)
 		healthStore.RefreshFromConfig()
-		// Re-probe all backends so a changed key/backend reflects immediately,
-		// instead of showing status frozen from the last process start.
-		healthStore.RecheckAll()
 		if dashRl != nil {
 			dashRl.SetTrustedProxies(newCfg.TrustedProxies)
 		}

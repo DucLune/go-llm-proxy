@@ -253,14 +253,8 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	startTime := time.Now()
 
-	// model.Timeout guards connect/headers and non-streaming bodies;
-	// streaming requests disarm it up front — a wall-clock cap on a
-	// live stream severs healthy long generations (see requestTimeout).
-	ctx, cancel, disarmTimeout := requestTimeout(r.Context(), model.Timeout)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(model.Timeout)*time.Second)
 	defer cancel()
-	if req.Stream {
-		disarmTimeout()
-	}
 
 	// Try native passthrough unless forced to translate.
 	if !h.shouldTranslate(model, "/responses") {

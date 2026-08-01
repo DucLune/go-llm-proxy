@@ -67,15 +67,22 @@ func TestBoundedCache_Eviction(t *testing.T) {
 	for i := 0; i < maxCacheEntries; i++ {
 		c.Store(keyN(i), "v")
 	}
-	// Next store should trigger bulk clear + insert.
+	// Re-touch the newest key so it counts as recently used and must survive.
+	c.Load(keyN(maxCacheEntries - 1))
+	// Next store triggers LRU eviction of the least-recently-used entry
+	// (key0, which was never re-touched), not a full-table flush.
 	c.Store("overflow", "new")
 	got, ok := c.Load("overflow")
 	if !ok || got != "new" {
 		t.Fatalf("expected new entry after eviction, got ok=%v val=%q", ok, got)
 	}
-	// Older entries gone.
+	// Oldest entry (never re-touched) is evicted.
 	if _, ok := c.Load(keyN(0)); ok {
-		t.Fatalf("expected older entry to be evicted")
+		t.Fatalf("expected oldest entry to be evicted")
+	}
+	// A recently-touched entry survives — LRU evicts one entry, not the whole cache.
+	if _, ok := c.Load(keyN(maxCacheEntries - 1)); !ok {
+		t.Fatalf("expected recently-used entry to survive eviction")
 	}
 }
 

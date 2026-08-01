@@ -196,10 +196,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	upstreamURL := strings.TrimRight(model.Backend, "/") + relPath
 
-	// model.Timeout guards the connect/header phase and non-streaming
-	// bodies; it is disarmed below once the response turns out to be a
-	// stream (see requestTimeout).
-	ctx, cancel, disarmTimeout := requestTimeout(r.Context(), model.Timeout)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(model.Timeout)*time.Second)
 	defer cancel()
 
 	upReq, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL, bytes.NewReader(body))
@@ -245,9 +242,6 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	isStreaming := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
-	if isStreaming {
-		disarmTimeout()
-	}
 
 	copyResponseHeaders(w, resp)
 	httputil.SetSecurityHeaders(w)

@@ -235,7 +235,7 @@ func TestProcessImages_NoImages(t *testing.T) {
 			},
 		},
 	}
-	result, err := p.processImages(context.Background(), chatReq, &config.ModelConfig{}, nil)
+	result, err := p.processImages(context.Background(), chatReq, &config.ModelConfig{}, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestDescribeImage_FallsBackToReasoningContent(t *testing.T) {
 			},
 		},
 	}
-	result, err := p.processImages(context.Background(), chatReq, visionModel, nil)
+	result, err := p.processImages(context.Background(), chatReq, visionModel, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +336,7 @@ func TestProcessImages_ReplacesImageWithDescription(t *testing.T) {
 		},
 	}
 
-	result, err := p.processImages(context.Background(), chatReq, visionModel, nil)
+	result, err := p.processImages(context.Background(), chatReq, visionModel, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +407,7 @@ func TestProcessImages_CacheHit(t *testing.T) {
 	}
 
 	// First call — should hit vision model.
-	result, err := p.processImages(context.Background(), makeChatReq(), visionModel, nil)
+	result, err := p.processImages(context.Background(), makeChatReq(), visionModel, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +421,7 @@ func TestProcessImages_CacheHit(t *testing.T) {
 	}
 
 	// Second call — should use cache, NOT call vision model again.
-	result, err = p.processImages(context.Background(), makeChatReq(), visionModel, nil)
+	result, err = p.processImages(context.Background(), makeChatReq(), visionModel, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -502,7 +502,7 @@ func TestProcessImages_ConcurrentAndOCRMode(t *testing.T) {
 		},
 	}
 
-	result, err := p.processImages(context.Background(), chatReq, visionModel, nil)
+	result, err := p.processImages(context.Background(), chatReq, visionModel, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,7 +564,7 @@ func TestProcessImages_VisionModelFailure(t *testing.T) {
 		},
 	}
 
-	result, err := p.processImages(context.Background(), chatReq, visionModel, nil)
+	result, err := p.processImages(context.Background(), chatReq, visionModel, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -638,7 +638,7 @@ func TestImageCascade_ToolRole_OCRSuccess_VisionNotCalled(t *testing.T) {
 	visionModel := &config.ModelConfig{Name: "vision-model", Backend: visionSrv.URL, Model: "vision"}
 
 	p := &Pipeline{client: http.DefaultClient}
-	result, err := p.processImages(context.Background(), toolRoleReq(), visionModel, ocrModel)
+	result, err := p.processImages(context.Background(), toolRoleReq(), visionModel, ocrModel, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -669,7 +669,7 @@ func TestImageCascade_ToolRole_OCREmpty_VisionFallback(t *testing.T) {
 	visionModel := &config.ModelConfig{Name: "vision-model", Backend: visionSrv.URL, Model: "vision"}
 
 	p := &Pipeline{client: http.DefaultClient}
-	result, err := p.processImages(context.Background(), toolRoleReq(), visionModel, ocrModel)
+	result, err := p.processImages(context.Background(), toolRoleReq(), visionModel, ocrModel, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -697,7 +697,7 @@ func TestImageCascade_ToolRole_OCRError_VisionFallback(t *testing.T) {
 	visionModel := &config.ModelConfig{Name: "vision-model", Backend: visionSrv.URL, Model: "vision"}
 
 	p := &Pipeline{client: http.DefaultClient}
-	result, err := p.processImages(context.Background(), toolRoleReq(), visionModel, ocrModel)
+	result, err := p.processImages(context.Background(), toolRoleReq(), visionModel, ocrModel, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -726,7 +726,7 @@ func TestImageCascade_ToolRole_BothFail_TTLShortCircuits(t *testing.T) {
 
 	p := &Pipeline{client: http.DefaultClient}
 	// First call: both stages should be attempted.
-	result, err := p.processImages(context.Background(), toolRoleReq(), visionModel, ocrModel)
+	result, err := p.processImages(context.Background(), toolRoleReq(), visionModel, ocrModel, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -740,7 +740,7 @@ func TestImageCascade_ToolRole_BothFail_TTLShortCircuits(t *testing.T) {
 	}
 
 	// Second call within TTL: neither upstream should be re-invoked.
-	_, err = p.processImages(context.Background(), toolRoleReq(), visionModel, ocrModel)
+	_, err = p.processImages(context.Background(), toolRoleReq(), visionModel, ocrModel, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -761,7 +761,7 @@ func TestImageCascade_ToolRole_OnlyVision_NoDuplicateCall(t *testing.T) {
 	visionModel := &config.ModelConfig{Name: "vision-model", Backend: srv.URL, Model: "vision"}
 
 	p := &Pipeline{client: http.DefaultClient}
-	_, err := p.processImages(context.Background(), toolRoleReq(), visionModel, nil)
+	_, err := p.processImages(context.Background(), toolRoleReq(), visionModel, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -800,7 +800,7 @@ func TestImageCascade_UserRole_OCRNotCalled(t *testing.T) {
 		},
 	}
 	p := &Pipeline{client: http.DefaultClient}
-	result, err := p.processImages(context.Background(), req, visionModel, ocrModel)
+	result, err := p.processImages(context.Background(), req, visionModel, ocrModel, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

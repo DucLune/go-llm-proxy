@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,30 @@ type ProcessorsConfig struct {
 	Audio        string `yaml:"audio"`          // model name for audio transcription (empty = disabled; pipeline integration pending)
 	OCR          string `yaml:"ocr"`            // model name for OCR/text extraction from PDF page images (falls back to vision)
 	WebSearchKey string `yaml:"web_search_key"` // web search API key — Tavily or Brave (empty = web search disabled)
+
+	// VisionMaxTokens caps the description length the vision model may produce.
+	// 0 means "use built-in defaults" (1000 for user images, 2000 for tool/PDF
+	// images). Non-zero overrides both. Raised to stop long/error-dense screenshots
+	// from being cut off at the default cap.
+	VisionMaxTokens int `yaml:"vision_max_tokens"`
+
+	// MaxImagesPerRequest caps how many unique images the vision pipeline will
+	// process in a single request. Beyond this, remaining images are replaced
+	// with "[Image omitted: too many images in request]". This bounds the number
+	// of outbound vision calls a single (possibly history-heavy) request can
+	// trigger. 0 means "use built-in default" (10).
+	MaxImagesPerRequest int `yaml:"max_images_per_request"`
+}
+
+// LogConfig controls file-based logging. When File is empty, logs go only to
+// stdout (preserving the original behavior). When set, slog writes to the file
+// via lumberjack (size-based rotation) as well as stdout.
+type LogConfig struct {
+	Level      string `yaml:"level"`        // "info" or "debug" (debug = -log-debug)
+	File       string `yaml:"file"`         // log file path; empty = no file logging
+	MaxSizeMB  int    `yaml:"max_size_mb"`  // max MB per log file before rotation (0 = 10)
+	MaxBackups int    `yaml:"max_backups"`  // number of old log files to keep (0 = 5)
+	Compress   *bool  `yaml:"compress"`     // gzip-compress rotated files (default true)
 }
 
 type Config struct {
@@ -32,6 +57,7 @@ type Config struct {
 	UsageDB                string           `yaml:"usage_db"`                 // path to SQLite usage database (default: usage.db)
 	UsageDashboard         bool             `yaml:"usage_dashboard"`          // enable the usage dashboard at /usage
 	UsageDashboardPassword string           `yaml:"usage_dashboard_password"` // password for the usage dashboard
+	Log                    LogConfig        `yaml:"log"`                      // file logging settings (optional)
 }
 
 const (
@@ -492,6 +518,21 @@ func validateConfig(cfg *Config) error {
 	}
 
 	return nil
+}
+
+// LogLevel returns the effective slog level for the config's log.level field.
+// Defaults to slog.LevelInfo; "debug" maps to slog.LevelDebug. Unknown values
+// fall back to info. The -log-debug CLI flag (handled in main) still overrides.
+func (c *LogConfig) LogLevel() slog.Level {
+	if c == nil {
+		return slog.LevelInfo
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Level)) {
+	case "debug":
+		return slog.LevelDebug
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // ApplySamplingDefaults injects default sampling parameters into a Chat Completions

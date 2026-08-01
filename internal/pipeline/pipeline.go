@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"time"
 
 	"go-llm-proxy/internal/config"
 )
@@ -14,16 +16,57 @@ import (
 // from the translation layer to the pipeline. Deleted before sending to backend.
 const InternalKeyStrippedTools = "_stripped_server_tools"
 
+// visionResponseHeaderTimeout bounds how long the pipeline waits for the vision
+// model to return response headers. This is deliberately much longer than the
+// general proxy client's 30s (see internal/httputil): vision models routinely
+// take 6-10s per image and can be slower under concurrent load, and a too-short
+// timeout here silently downgrades images to "[Image could not be processed]".
+const visionResponseHeaderTimeout = 180 * time.Second
+
 // Pipeline orchestrates pre-send content processing for translated Chat Completions requests.
 // It detects unsupported content (images, PDFs) and routes them to capable processor models.
 type Pipeline struct {
 	config *config.ConfigStore
 	client *http.Client
+	// visionClient is a dedicated HTTP client for vision/OCR model calls. It uses
+	// a longer response-header timeout than the general client so slow vision
+	// models (large images, concurrent batches) aren't cut off mid-description.
+	// Falls back to client when nil (tests, callers that build the Pipeline
+	// without a vision client).
+	visionClient *http.Client
 }
 
 // NewPipeline creates a pipeline that uses the given config and HTTP client for processor calls.
+// A dedicated vision client with a longer response-header timeout is created for
+// vision-model calls so that slow vision backends aren't bounded by the general
+// client's 30s timeout (which previously caused images to be downgraded to
+// "[Image could not be processed]").
 func NewPipeline(cs *config.ConfigStore, client *http.Client) *Pipeline {
-	return &Pipeline{config: cs, client: client}
+	return &Pipeline{config: cs, client: client, visionClient: newVisionClient()}
+}
+
+// newVisionClient returns an HTTP client for vision-model calls with a long
+// response-header timeout. Shares dial/TLS tuning with the general client but
+// tolerates the slow, token-heavy responses vision models produce.
+func newVisionClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: visionResponseHeaderTimeout,
+			ExpectContinueTimeout: 1 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			ForceAttemptHTTP2:     true,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 // processingSignatures are byte patterns that indicate a request body may contain
@@ -144,7 +187,13 @@ func (p *Pipeline) ProcessRequest(ctx context.Context, chatReq map[string]any,
 	// Skip if the vision model IS the target (avoid pointless round-trip).
 	if visionModel != nil && visionModel.Name != targetModel.Name && (!targetModel.SupportsVision || targetModel.ForcePipeline) {
 		var err error
-		chatReq, err = p.processImages(ctx, chatReq, visionModel, ocrModel)
+		// processors.vision_max_tokens (0 = built-in defaults) caps how many
+		// tokens the vision model may spend describing each image.
+		visionMaxTokens := cfg.Processors.VisionMaxTokens
+		// processors.max_images_per_request (0 = built-in default of 10) caps
+		// how many unique images a single request may process.
+		maxImagesPerRequest := cfg.Processors.MaxImagesPerRequest
+		chatReq, err = p.processImages(ctx, chatReq, visionModel, ocrModel, visionMaxTokens, maxImagesPerRequest)
 		if err != nil {
 			slog.Warn("vision processing error", "error", err)
 		}

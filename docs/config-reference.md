@@ -80,6 +80,8 @@ processors:
   vision: Qwen3-VL-8B           # model name for vision processing (must be in models list)
   ocr: PaddleOCR-VL-1.5         # fast model for PDF/document text extraction (falls back to vision)
   web_search_key: tvly-...      # Tavily API key for web search
+  vision_max_tokens: 1000       # optional: cap description length per image (0 = built-in 1000/2000 per role)
+  max_images_per_request: 30    # optional: max unique images processed per request
 ```
 
 | Field | Default | Description |
@@ -87,6 +89,8 @@ processors:
 | `vision` | — | Model name to use for describing images sent to text-only backends. Must be a vision-capable model defined in `models`. |
 | `ocr` | — | Model name for OCR/text extraction from PDF page images. Use a fast, lightweight vision model here. Falls back to `vision` if not set. |
 | `web_search_key` | — | Search API key. Supports [Tavily](https://tavily.com/) (`tvly-...`) and [Brave Search](https://brave.com/search/api/) (`BSA...`) — provider is auto-detected from the key prefix. When set, the proxy executes web searches on behalf of clients (Claude Code, Codex) transparently. |
+| `vision_max_tokens` | `0` | Cap on the description length the vision model may produce per image. `0` = built-in defaults (1000 for user images, 2000 for tool/PDF images). Raise this to stop long or error-dense screenshots from being truncated mid-description. |
+| `max_images_per_request` | `10` | Maximum number of unique images the vision pipeline will process in a single request. Additional images are replaced with a placeholder. Claude Code replays full conversation history on every request, so long conversations accumulate images — raise this if images beyond the cap keep being dropped. |
 
 ### Per-model processor overrides
 

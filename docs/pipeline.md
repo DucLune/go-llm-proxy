@@ -56,9 +56,10 @@ Injected content is wrapped in XML-like tags so target models clearly distinguis
 ### Processing details
 
 - Images are processed **concurrently** (up to 5 in parallel)
-- Successful results are **cached by content hash** — follow-up turns with the same image are instant
+- Successful results are **cached by content hash** — follow-up turns with the same image are instant. The cache evicts **least-recently-used entries** (max 1024) rather than clearing wholesale, so historical images stay warm across turns even as a conversation grows
+- Vision-model calls use a **dedicated HTTP client** with a 180s response-header timeout (vs. 30s for the general client), so slow vision backends aren't cut off mid-description
 - Failed extractions are cached for **5 minutes** so transient upstream issues don't permanently block an image but a misbehaving client can't hammer the cascade every turn
-- Maximum **10 images per request** — additional images get a placeholder
+- Maximum unique images per request defaults to **10** (configurable via `processors.max_images_per_request`); additional images get a placeholder
 - Cache keys include a mode suffix (`:v` for vision, `:o` for OCR, `:fail` for the short-TTL failure marker) so results are stored independently
 - Reasoning/thinking is disabled for vision model calls to maximize output quality
 
@@ -147,7 +148,7 @@ All pipeline results are cached by content hash for the lifetime of the proxy pr
 - **PDF text extraction**: cached per PDF content hash
 - **Vision model OCR fallback**: cached per PDF content hash
 
-Cache is in-memory only and resets on proxy restart. There is no cache size limit — for typical usage (hundreds of images/PDFs per session) memory impact is negligible.
+Cache is in-memory only and resets on proxy restart. It is bounded to **1024 entries** per cache; when full, the least-recently-used entry is evicted to make room (no wholesale flush). This keeps memory bounded while preserving recent descriptions — historical images stay warm across turns instead of forcing the vision model to re-describe them every time Claude Code replays conversation history.
 
 ## Pipeline flow
 

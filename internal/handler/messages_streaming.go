@@ -60,6 +60,27 @@ func (h *MessagesHandler) handleStreaming(w http.ResponseWriter, resp *http.Resp
 	}
 
 	emitMessageStart := func() {
+		// If the first upstream chunk already carried usage (DeepSeek does this),
+		// surface real token + cache numbers instead of a fake usage. Falls back
+		// to a minimal usage so the Anthropic event shape stays valid.
+		// Anthropic input_tokens EXCLUDES cache hits; subtract cached_tokens.
+		usage := map[string]any{"input_tokens": 0, "output_tokens": 1}
+		if usageData != nil {
+			cacheRead := 0
+			if usageData.PromptTokensDetails != nil {
+				cacheRead = usageData.PromptTokensDetails.CachedTokens
+			}
+			inputTokens := usageData.PromptTokens - cacheRead
+			if inputTokens < 0 {
+				inputTokens = 0
+			}
+			usage = map[string]any{
+				"input_tokens":                inputTokens,
+				"output_tokens":               usageData.CompletionTokens,
+				"cache_creation_input_tokens": 0,
+				"cache_read_input_tokens":     cacheRead,
+			}
+		}
 		emit("message_start", map[string]any{
 			"message": map[string]any{
 				"id":            msgID,
@@ -69,7 +90,7 @@ func (h *MessagesHandler) handleStreaming(w http.ResponseWriter, resp *http.Resp
 				"model":         upstreamModel,
 				"stop_reason":   nil,
 				"stop_sequence": nil,
-				"usage":         map[string]any{"input_tokens": 0, "output_tokens": 1},
+				"usage":         usage,
 			},
 		})
 		slog.Debug("emitted message_start", "model", upstreamModel)
@@ -176,13 +197,13 @@ func (h *MessagesHandler) handleStreaming(w http.ResponseWriter, resp *http.Resp
 		if chunk.Model != "" {
 			upstreamModel = chunk.Model
 		}
+		if chunk.Usage != nil {
+			usageData = chunk.Usage
+		}
 		if !msgStartEmitted {
 			emitMessageStart()
 			// Emit ping for keepalive.
 			emit("ping", map[string]any{})
-		}
-		if chunk.Usage != nil {
-			usageData = chunk.Usage
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -468,9 +489,29 @@ func (h *MessagesHandler) handleStreaming(w http.ResponseWriter, resp *http.Resp
 			outputTokens = usageData.CompletionTokens
 		}
 
+		// Anthropic input_tokens EXCLUDES cache hits (they are reported
+		// separately via cache_read_input_tokens). OpenAI's prompt_tokens
+		// INCLUDES them, so subtract cached_tokens before emitting, matching
+		// DeepSeek's own Anthropic endpoint semantics (input + cache_read ==
+		// prompt_tokens).
 		var inputTokens int
 		if usageData != nil {
 			inputTokens = usageData.PromptTokens
+			if usageData.PromptTokensDetails != nil {
+				inputTokens -= usageData.PromptTokensDetails.CachedTokens
+				if inputTokens < 0 {
+					inputTokens = 0
+				}
+			}
+		}
+
+		// Pass through cache_read tokens from the upstream OpenAI backend.
+		// DeepSeek's OpenAI endpoint reports cache hits via
+		// prompt_tokens_details.cached_tokens; map that onto Anthropic's
+		// cache_read_input_tokens so monitoring panels see real hit counts.
+		cacheRead := 0
+		if usageData != nil && usageData.PromptTokensDetails != nil {
+			cacheRead = usageData.PromptTokensDetails.CachedTokens
 		}
 
 		emit("message_delta", map[string]any{
@@ -479,7 +520,7 @@ func (h *MessagesHandler) handleStreaming(w http.ResponseWriter, resp *http.Resp
 				"input_tokens":                inputTokens,
 				"output_tokens":               outputTokens,
 				"cache_creation_input_tokens": 0,
-				"cache_read_input_tokens":     0,
+				"cache_read_input_tokens":     cacheRead,
 			},
 		})
 

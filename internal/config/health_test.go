@@ -317,35 +317,3 @@ func TestHealthStore_RecordUsage(t *testing.T) {
 		t.Errorf("expected no error, got %q", status.Error)
 	}
 }
-
-// TestHealthStore_RecheckAll verifies that RecheckAll re-probes a backend and
-// refreshes its status — the mechanism that lets a config reload clear a stale
-// "offline" flag without a process restart.
-func TestHealthStore_RecheckAll(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ts.Close()
-
-	cfg := &Config{
-		Models: []ModelConfig{
-			{Name: "test-model", Backend: ts.URL, Timeout: 300},
-		},
-	}
-	cs := NewTestConfigStore(cfg)
-	hs := NewHealthStore(cs, time.Minute, 5*time.Second)
-
-	// Simulate a stale offline status (e.g. frozen from an earlier boot).
-	hs.RecordUsage("test-model", false, "stale offline")
-	if status, _ := hs.GetStatusForModel("test-model"); status.Online {
-		t.Fatalf("precondition: expected model offline before recheck")
-	}
-
-	// A recheck should re-probe the (now reachable) backend and clear it.
-	hs.RecheckAll()
-	time.Sleep(100 * time.Millisecond) // probes run asynchronously
-
-	if status, _ := hs.GetStatusForModel("test-model"); !status.Online {
-		t.Errorf("expected model online after RecheckAll, error=%q", status.Error)
-	}
-}

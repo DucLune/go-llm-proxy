@@ -95,6 +95,8 @@ processors:
   vision: Qwen3-VL-8B        # vision model for image descriptions
   ocr: paddleOCR              # fast model for PDF page text extraction (optional; vision is tried automatically if OCR fails)
   web_search_key: tvly-...    # Tavily or Brave Search key (auto-detected from prefix)
+  vision_max_tokens: 1000     # optional: cap description length per image (0 = built-in 1000/2000 per role)
+  max_images_per_request: 30  # optional: max unique images processed per request (default 10)
 ```
 
 Without `processors`, the proxy just translates and routes. With it, images, PDFs, and search work on text-only backends.

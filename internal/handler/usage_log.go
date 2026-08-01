@@ -1,42 +1,11 @@
 package handler
 
 import (
-	"fmt"
 	"time"
 
 	"go-llm-proxy/internal/api"
-	"go-llm-proxy/internal/config"
 	"go-llm-proxy/internal/usage"
 )
-
-// healthRecorder is the process-wide health store, set once at startup via
-// SetHealthStore. It lets the usage-logging funnel update backend health from
-// real request outcomes without threading the store through every handler.
-// nil-safe: if unset (e.g. in tests), health recording is skipped.
-var healthRecorder *config.HealthStore
-
-// SetHealthStore registers the health store used by recordBackendHealth.
-// Call once during startup, before serving requests.
-func SetHealthStore(hs *config.HealthStore) { healthRecorder = hs }
-
-// recordBackendHealth updates a model's health from an upstream status code.
-// Only backend-caused outcomes move the needle: 2xx marks online; auth/billing
-// (401/402/403) and server errors (5xx) mark offline. Other 4xx (bad request,
-// unknown model) and 429 rate-limits are client- or transient-side, so they
-// leave the existing status untouched to avoid false "offline" flapping.
-func recordBackendHealth(model string, statusCode int) {
-	if healthRecorder == nil || model == "" {
-		return
-	}
-	switch {
-	case statusCode >= 200 && statusCode < 300:
-		healthRecorder.RecordUsage(model, true, "")
-	case statusCode == 401 || statusCode == 402 || statusCode == 403:
-		healthRecorder.RecordUsage(model, false, fmt.Sprintf("backend rejected credentials: HTTP %d", statusCode))
-	case statusCode >= 500:
-		healthRecorder.RecordUsage(model, false, fmt.Sprintf("backend error: HTTP %d", statusCode))
-	}
-}
 
 // Unified usage-logging helpers.
 //
@@ -68,9 +37,6 @@ type usageLogInput struct {
 // Emission is deferred to a goroutine so the caller's hot path is not
 // blocked by SQLite contention.
 func logUsage(ul *usage.UsageLogger, in usageLogInput) {
-	// Update backend health from the outcome first — this must run even when
-	// usage logging is disabled (ul == nil).
-	recordBackendHealth(in.model, in.statusCode)
 	if ul == nil {
 		return
 	}

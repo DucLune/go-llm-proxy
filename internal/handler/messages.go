@@ -112,17 +112,8 @@ func (h *MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	startTime := time.Now()
 
-	// model.Timeout guards connect/headers and non-streaming bodies.
-	// Streaming requests disarm it up front: the stream flag is in the
-	// request here (unlike the passthrough proxy, which must sniff the
-	// response Content-Type), and a wall-clock cap on a live stream
-	// severs healthy long generations (see requestTimeout). Pre-stream
-	// phases stay bounded by the transport's dial/TLS/header timeouts.
-	ctx, cancel, disarmTimeout := requestTimeout(r.Context(), model.Timeout)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(model.Timeout)*time.Second)
 	defer cancel()
-	if req.Stream {
-		disarmTimeout()
-	}
 
 	// AWS Bedrock backends use the Converse API (translated from Anthropic
 	// Messages, signed with SigV4 or a Bedrock API key) instead of Chat
@@ -463,11 +454,25 @@ func (h *MessagesHandler) handleNonStreaming(w http.ResponseWriter, resp *http.R
 
 	var usageObj map[string]any
 	if chatResp.Usage != nil {
+		// Pass through cache_read tokens from the upstream OpenAI backend.
+		// DeepSeek's OpenAI endpoint reports cache hits via
+		// prompt_tokens_details.cached_tokens; map that onto Anthropic's
+		// cache_read_input_tokens so monitoring panels see real hit counts.
+		// Anthropic input_tokens EXCLUDES cache hits, so subtract cached_tokens
+		// (input + cache_read == prompt_tokens), matching DeepSeek's own endpoint.
+		cacheRead := 0
+		if chatResp.Usage.PromptTokensDetails != nil {
+			cacheRead = chatResp.Usage.PromptTokensDetails.CachedTokens
+		}
+		inputTokens := chatResp.Usage.PromptTokens - cacheRead
+		if inputTokens < 0 {
+			inputTokens = 0
+		}
 		usageObj = map[string]any{
-			"input_tokens":                chatResp.Usage.PromptTokens,
+			"input_tokens":                inputTokens,
 			"output_tokens":               chatResp.Usage.CompletionTokens,
 			"cache_creation_input_tokens": 0,
-			"cache_read_input_tokens":     0,
+			"cache_read_input_tokens":     cacheRead,
 		}
 	}
 

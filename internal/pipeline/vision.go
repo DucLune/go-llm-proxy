@@ -30,10 +30,12 @@ func ResetImageCache() {
 	imageCache.Reset()
 }
 
-// maxImagesPerRequest caps the number of images the vision processor will handle
-// in a single request. Beyond this, remaining images get a placeholder to prevent
-// a single request from triggering unbounded outbound HTTP calls.
-const maxImagesPerRequest = 10
+// defaultMaxImagesPerRequest caps the number of unique images the vision
+// processor will handle in a single request when the operator hasn't configured
+// processors.max_images_per_request. Beyond this, remaining images get a
+// placeholder to prevent a single request from triggering unbounded outbound
+// HTTP calls.
+const defaultMaxImagesPerRequest = 10
 
 // maxConcurrentVision limits how many concurrent vision model calls are made.
 const maxConcurrentVision = 5
@@ -42,6 +44,16 @@ const maxConcurrentVision = 5
 // enough to allow retry after transient upstream issues, long enough to
 // prevent re-running the full cascade on every turn for the same image.
 const imageFailureTTL = 5 * time.Minute
+
+// minDescriptionLen is the minimum length (in runes) for a *user-role* vision
+// description to be accepted and permanently cached. Set deliberately low: real
+// descriptions of simple images can be short ("A red circle on white"), so this
+// is only a backstop against degenerate fragments — the primary truncation
+// signal is finish_reason=length, and stale-model reuse is prevented by the
+// model+prompt key. Descriptions shorter than this are not cached permanently,
+// so a following turn retries. Tool-role OCR/PDF output is exempt — "No text"
+// is a legitimate result there and the cascade handles it.
+const minDescriptionLen = 10
 
 // Vision prompts — the describe prompt is for general images; the OCR prompt is
 // for PDF page images where text extraction is more useful than visual description.
@@ -58,8 +70,14 @@ const (
 // parts with text descriptions. Images are processed concurrently for speed, and
 // PDF page images (detected via tool result heuristics) use the OCR model with a
 // text-extraction prompt. ocrModel may be nil, in which case visionModel is used.
+// visionMaxTokens overrides the per-image description caps when non-zero (0 = use
+// built-in defaults of 1000 for user images / 2000 for tool images).
 func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
-	visionModel *config.ModelConfig, ocrModel *config.ModelConfig) (map[string]any, error) {
+	visionModel *config.ModelConfig, ocrModel *config.ModelConfig, visionMaxTokens int, maxImagesPerRequest int) (map[string]any, error) {
+
+	if maxImagesPerRequest <= 0 {
+		maxImagesPerRequest = defaultMaxImagesPerRequest
+	}
 
 	// Normalize messages to []any — translation layers may produce []map[string]any.
 	var messages []any
@@ -91,6 +109,7 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 		prompt    string
 		maxTokens int
 		model     *config.ModelConfig
+		role      string // "user" or "tool" — whether the description came from a user image or tool/PDF output
 		// Fallback stage: used by the tool-role OCR→vision cascade. When the
 		// primary model fails or returns empty, retry with fallbackModel
 		// using fallbackPrompt. Zero-valued when no cascade is needed (user-role
@@ -100,6 +119,13 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 	}
 	var jobs []imageJob
 	seenKeys := map[string]bool{}
+	// countSeen tracks unique image URLs seen so far in this request so that
+	// the maxImagesPerRequest cap counts *unique* images, not raw image_url
+	// parts. Claude Code replays the full conversation history on every request,
+	// so the same pasted image can appear in many messages; counting each
+	// occurrence would exhaust the cap on history alone and silently drop the
+	// user's new image. This mirrors the replacement pass (replacementSeen).
+	countSeen := map[string]bool{}
 
 	imageCount := 0
 	for _, msg := range messages {
@@ -121,17 +147,26 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 				continue
 			}
 
-			imageCount++
-			if imageCount > maxImagesPerRequest {
-				continue
-			}
-
 			url := extractImageURL(partMap)
 			if url == "" {
 				continue
 			}
 
-			// SSRF pre-flight: cheaply reject URLs whose hostname itself is
+			// Cap on unique images only. Re-references of an image already seen
+			// in this request don't consume additional budget — they'll reuse the
+			// cached/fresh description in the replacement pass.
+			urlHash := hashImageURL(url)
+			if countSeen[urlHash] {
+				continue
+			}
+			countSeen[urlHash] = true
+
+			imageCount++
+			if imageCount > maxImagesPerRequest {
+				slog.Warn("too many unique images in request; skipping image processing",
+					"image_count", imageCount-1, "limit", maxImagesPerRequest)
+				continue
+			}			// SSRF pre-flight: cheaply reject URLs whose hostname itself is
 			// an obvious block-target (literal private IP, metadata name).
 			// The authoritative enforcement is the safeHTTPClient dialer
 			// used later in describeImage — it re-validates every resolved
@@ -141,10 +176,24 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 				continue
 			}
 
-			hash := hashImageURL(url)
-
+			// Cache key for the current image_url part is computed per-branch
+			// below (tool vs user), folding in the processor model and prompt so
+			// that switching models or prompts yields a fresh key.
 			if isToolRole {
 				// Tool-role images (PDF pages, screenshots): OCR → vision cascade.
+				// Primary: dedicated OCR model if configured; else vision w/
+				// OCR-style prompt (matches pre-cascade behavior).
+				primary := visionModel
+				primaryPrompt := visionPromptOCR
+				if ocrModel != nil {
+					primary = ocrModel
+					primaryPrompt = ocrModelPrompt
+				}
+				// Cache key folds image URL + processor model + prompt so that
+				// switching models (or prompts) yields a fresh key. Image URL alone
+				// is insufficient — the same URL cached a description from a
+				// previous model would otherwise be silently reused.
+				hash := imageCacheKey(url, true, visionModel, ocrModel)
 				ocrKey := hash + ":o"
 				failKey := hash + ":fail"
 				if _, ok := imageCache.Load(ocrKey); ok {
@@ -159,14 +208,6 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 				}
 				seenKeys[ocrKey] = true
 
-				// Primary: dedicated OCR model if configured; else vision w/
-				// OCR-style prompt (matches pre-cascade behavior).
-				primary := visionModel
-				primaryPrompt := visionPromptOCR
-				if ocrModel != nil {
-					primary = ocrModel
-					primaryPrompt = ocrModelPrompt
-				}
 				// Fallback: vision model, but only if it's a different instance
 				// than the primary. Avoids double-calling the same backend when
 				// the operator configured only one processor.
@@ -178,20 +219,22 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 				}
 				jobs = append(jobs, imageJob{
 					url: url, cacheKey: ocrKey, failKey: failKey,
-					prompt: primaryPrompt, maxTokens: 2000, model: primary,
-					fallbackModel: fallbackMdl, fallbackPrompt: fallbackPrompt,
+					prompt: primaryPrompt, maxTokens: maxTokensForRole("tool", visionMaxTokens), model: primary,
+					role:           "tool",
+					fallbackModel:  fallbackMdl, fallbackPrompt: fallbackPrompt,
 				})
 			} else {
 				// User-role images: vision description only.
 				// OCR is skipped for user-attached photos — dedicated OCR models
 				// hallucinate on natural images. Text in photos is captured
 				// adequately by the vision model's description.
-				vKey := hash + ":v"
+				vKey := imageCacheKey(url, false, visionModel, ocrModel) + ":v"
 				if _, ok := imageCache.Load(vKey); !ok && !seenKeys[vKey] {
 					seenKeys[vKey] = true
 					jobs = append(jobs, imageJob{
 						url: url, cacheKey: vKey,
-						prompt: visionPromptDescribe, maxTokens: 1000, model: visionModel,
+						prompt: visionPromptDescribe, maxTokens: maxTokensForRole("user", visionMaxTokens), model: visionModel,
+						role: "user",
 					})
 				}
 			}
@@ -249,6 +292,18 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 					imageCache.StoreWithTTL(jobs[i].failKey, "1", imageFailureTTL)
 				}
 			} else {
+				// A user-role description that is suspiciously short is almost
+				// certainly a truncated fragment ("This is a screenshot of a"),
+				// not a real description. Do not permanently cache it — treat it
+				// as a failure so the next turn retries rather than surfacing
+				// (and caching) the fragment forever. Tool-role OCR/PDF output is
+				// exempt: "No text" is legitimate there and the cascade handles it.
+				if jobs[i].role == "user" && len([]rune(strings.TrimSpace(r.desc))) < minDescriptionLen {
+					slog.Warn("vision description too short; not caching",
+						"model", jobs[i].model.Name, "cache_key", jobs[i].cacheKey,
+						"len", len([]rune(strings.TrimSpace(r.desc))))
+					continue
+				}
 				imageCache.Store(jobs[i].cacheKey, r.desc)
 			}
 		}
@@ -268,6 +323,13 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 	// --- Second pass: replace images with combined descriptions. ---
 	imageCount = 0
 	anyModified := false
+	// replacementSeen tracks the unique images already emitted in this pass.
+	// The replacement counter counts *unique* images, not raw image_url parts —
+	// a request that re-references the same image across messages/turns should
+	// not consume extra budget for repeats (matching how the first pass dedups
+	// processing via seenKeys). Only the first occurrence of each unique image
+	// counts toward maxImagesPerRequest.
+	replacementSeen := map[string]bool{}
 	for i, msg := range messages {
 		msgMap, ok := msg.(map[string]any)
 		if !ok {
@@ -294,16 +356,6 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 				continue
 			}
 
-			imageCount++
-			if imageCount > maxImagesPerRequest {
-				newContent = append(newContent, map[string]any{
-					"type": "text",
-					"text": "[Image omitted: too many images in request]",
-				})
-				msgModified = true
-				continue
-			}
-
 			imageURL := extractImageURL(partMap)
 			if imageURL == "" {
 				newContent = append(newContent, map[string]any{
@@ -314,8 +366,34 @@ func (p *Pipeline) processImages(ctx context.Context, chatReq map[string]any,
 				continue
 			}
 
-			hash := hashImageURL(imageURL)
-			replacement := buildImageReplacement(hash, isToolRole, imageCache, jobDescriptions)
+			// Unique-image de-dup for the max-images cap uses the URL hash alone —
+			// "same image re-referenced" is what matters there, not which model
+			// described it. The description lookup below uses the full cache key
+			// (imageCacheKey), which folds in the model+prompt and MUST match the
+			// key used in the processing pass.
+			urlHash := hashImageURL(imageURL)
+
+			// Only the first occurrence of each unique image counts toward the cap.
+			// Re-references of an already-emitted image reuse its description and
+			// do not consume additional budget.
+			firstSeen := !replacementSeen[urlHash]
+			replacementSeen[urlHash] = true
+			if firstSeen {
+				imageCount++
+				if imageCount > maxImagesPerRequest {
+					newContent = append(newContent, map[string]any{
+						"type": "text",
+						"text": "[Image omitted: too many images in request]",
+					})
+					msgModified = true
+					continue
+				}
+			}
+
+			// Resolve the same cache key the processing pass used, so we look up
+			// the description that was actually stored for this image/model/prompt.
+			keyHash := imageCacheKey(imageURL, isToolRole, visionModel, ocrModel)
+			replacement := buildImageReplacement(keyHash, isToolRole, imageCache, jobDescriptions)
 
 			newContent = append(newContent, map[string]any{
 				"type": "text",
@@ -382,6 +460,8 @@ func buildImageReplacement(hash string, isToolRole bool, cache *boundedCache, jo
 		if ocrText, ok := lookup(hash + ":o"); ok {
 			return fmt.Sprintf("<page_text>%s</page_text>", ocrText)
 		}
+		slog.Warn("image replacement miss (tool-role)",
+			"cache_key", hash+":o", "cache_size", cache.Size())
 		return "[Image could not be processed]"
 	}
 
@@ -389,6 +469,8 @@ func buildImageReplacement(hash string, isToolRole bool, cache *boundedCache, jo
 	if visionDesc, ok := lookup(hash + ":v"); ok {
 		return fmt.Sprintf("<image_description>%s</image_description>", visionDesc)
 	}
+	slog.Warn("image replacement miss (user-role)",
+		"cache_key", hash+":v", "cache_size", cache.Size())
 	return "[Image could not be processed]"
 }
 
@@ -397,6 +479,39 @@ func buildImageReplacement(hash string, isToolRole bool, cache *boundedCache, jo
 func hashImageURL(imageURL string) string {
 	h := sha256.Sum256([]byte(imageURL))
 	return fmt.Sprintf("%x", h)
+}
+
+// imageCacheKey computes the cache-key hash for an image, folding the image
+// URL together with the processor model and prompt so that switching the
+// vision/OCR model (or prompt) produces a fresh key instead of silently
+// reusing a stale description cached under the old model. The model/prompt
+// resolution mirrors the job-building logic and MUST stay identical between
+// the processing pass and the replacement pass, or the two passes will look
+// up different keys.
+func imageCacheKey(imageURL string, isToolRole bool, visionModel, ocrModel *config.ModelConfig) string {
+	if isToolRole {
+		primary := visionModel
+		primaryPrompt := visionPromptOCR
+		if ocrModel != nil {
+			primary = ocrModel
+			primaryPrompt = ocrModelPrompt
+		}
+		return hashImageURL(imageURL + "|" + primary.Name + "|" + primaryPrompt)
+	}
+	return hashImageURL(imageURL + "|" + visionModel.Name + "|" + visionPromptDescribe)
+}
+
+// maxTokensForRole returns the description token cap for an image job.
+// An explicit non-zero visionMaxTokens (from processors.vision_max_tokens)
+// overrides the built-in per-role defaults.
+func maxTokensForRole(role string, visionMaxTokens int) int {
+	if visionMaxTokens > 0 {
+		return visionMaxTokens
+	}
+	if role == "tool" {
+		return 2000
+	}
+	return 1000
 }
 
 // extractImageURL gets the URL string from an image_url content part.
@@ -479,9 +594,12 @@ func (p *Pipeline) describeImage(ctx context.Context, visionModel *config.ModelC
 
 	// Use a dedicated timeout instead of the caller's context. The caller's
 	// context is tied to the client connection, which may be closed (e.g. Claude
-	// Code retry) before the vision model finishes. A 60s timeout gives large
-	// images enough time while still bounding the call.
-	visionCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// Code retry) before the vision model finishes. 120s gives large images and
+	// busy vision backends enough headroom while still bounding the call. This
+	// pairs with the dedicated vision client's 180s response-header timeout
+	// (see visionResponseHeaderTimeout in pipeline.go): the context is the
+	// outer bound, the transport timeout the inner one.
+	visionCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	_ = ctx // original context intentionally unused
 
@@ -536,7 +654,14 @@ func (p *Pipeline) describeImage(ctx context.Context, visionModel *config.ModelC
 		req.Header.Set("Authorization", "Bearer "+visionModel.APIKey)
 	}
 
-	resp, err := p.client.Do(req)
+	// Use the dedicated vision client (longer response-header timeout) when
+	// available, falling back to the general client for callers that construct
+	// the Pipeline without one (e.g. tests using http.DefaultClient).
+	client := p.visionClient
+	if client == nil {
+		client = p.client
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("vision model request: %w", err)
 	}
@@ -584,6 +709,20 @@ func (p *Pipeline) describeImage(ctx context.Context, visionModel *config.ModelC
 		slog.Debug("vision model emitted only reasoning_content; using it as description",
 			"vision_model", visionModel.Name,
 			"finish_reason", chatResp.Choices[0].FinishReason)
+	}
+	// Detect truncation: if the vision model hit its token cap (finish_reason=length)
+	// while emitting the content channel, the answer is a partial fragment, not a
+	// complete description. Treat it as a failure so the cascade can retry (and so
+	// the truncated fragment is never cached). When maxTokens is generous, an
+	// intentional long response can still be cut short here and retried — acceptable,
+	// since a retry is cheap and the fragment is never surfaced as-is.
+	//
+	// Only applies when content was the source. When we fell back to
+	// reasoning_content, the model (e.g. Qwen3-VL) put its description in the
+	// thinking channel — a known pattern where finish_reason=length is common and
+	// the reasoning text is a complete, useful description that should be surfaced.
+	if chatResp.Choices[0].FinishReason == "length" && source == "content" {
+		return "", fmt.Errorf("vision model response truncated (finish_reason=length)")
 	}
 	if strings.TrimSpace(desc) == "" {
 		return "", fmt.Errorf("vision model returned empty response")
