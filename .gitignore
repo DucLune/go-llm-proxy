@@ -21,3 +21,9 @@ proxy-*.log.gz
 startup_test.log
 usage.db
 usage.db-*
+
+# Secrets (never commit)
+.env
+
+# Test/compare run artifacts (never commit)
+out/

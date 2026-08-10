@@ -5,25 +5,96 @@ import (
 	"log/slog"
 	"strings"
 
+	"go-llm-proxy/internal/config"
 	"go-llm-proxy/internal/pipeline"
 )
 
 // --- Anthropic Messages API request types ---
 
 type messagesRequest struct {
-	Model         string            `json:"model"`
-	Messages      []json.RawMessage `json:"messages"`
-	System        json.RawMessage   `json:"system,omitempty"`
-	Tools         []json.RawMessage `json:"tools,omitempty"`
-	ToolChoice    json.RawMessage   `json:"tool_choice,omitempty"`
-	MaxTokens     int               `json:"max_tokens"`
-	StopSequences []string          `json:"stop_sequences,omitempty"`
-	Temperature   *float64          `json:"temperature,omitempty"`
-	TopP          *float64          `json:"top_p,omitempty"`
-	TopK          *int              `json:"top_k,omitempty"`
-	Stream        bool              `json:"stream"`
-	Metadata      json.RawMessage   `json:"metadata,omitempty"`
-	Thinking      json.RawMessage   `json:"thinking,omitempty"`
+	Model           string            `json:"model"`
+	Messages        []json.RawMessage `json:"messages"`
+	System          json.RawMessage   `json:"system,omitempty"`
+	Tools           []json.RawMessage `json:"tools,omitempty"`
+	ToolChoice      json.RawMessage   `json:"tool_choice,omitempty"`
+	MaxTokens       int               `json:"max_tokens"`
+	StopSequences   []string          `json:"stop_sequences,omitempty"`
+	Temperature     *float64          `json:"temperature,omitempty"`
+	TopP            *float64          `json:"top_p,omitempty"`
+	TopK            *int              `json:"top_k,omitempty"`
+	Stream          bool              `json:"stream"`
+	Metadata        json.RawMessage   `json:"metadata,omitempty"`
+	Thinking        json.RawMessage   `json:"thinking,omitempty"`
+	ReasoningEffort string            `json:"reasoning_effort,omitempty"`
+}
+
+// effortFromClient extracts the reasoning effort a client requested, either
+// from a top-level reasoning_effort field (OpenAI-style clients) or from a
+// Claude Code-style thinking block. Returns the normalized effort ("" if none
+// requested) and whether thinking is enabled at all.
+//
+// Claude Code's /effort maps to thinking.budget_tokens (low=1024, medium=8192,
+// high=20480, xhigh=32768, max=64000). DeepSeek accepts low/high/xhigh/max but
+// has no "medium", so medium is normalized to high. "adaptive" carries no fixed
+// budget — treat conservatively as high (DeepSeek's default).
+func effortFromClient(req messagesRequest) (effort string, thinkingEnabled bool) {
+	thinkingEnabled = true // Anthropic thinking is on unless explicitly disabled
+
+	// Top-level reasoning_effort wins if present.
+	if req.ReasoningEffort != "" {
+		return normalizeEffort(req.ReasoningEffort), thinkingEnabled
+	}
+
+	if len(req.Thinking) > 0 && string(req.Thinking) != "null" {
+		var tc struct {
+			Type    string `json:"type"`
+			BudgetT int    `json:"budget_tokens"`
+		}
+		if json.Unmarshal(req.Thinking, &tc) == nil {
+			switch tc.Type {
+			case "disabled":
+				return "", false
+			case "adaptive":
+				return "high", true
+			}
+			if tc.BudgetT > 0 {
+				return normalizeEffort(budgetToEffort(tc.BudgetT)), true
+			}
+			// enabled with no budget: fall through to default.
+		}
+	}
+	return "", thinkingEnabled
+}
+
+// normalizeEffort maps a client effort value to one DeepSeek understands.
+// Returns "" for unrecognized values (leave unset).
+func normalizeEffort(e string) string {
+	switch e {
+	case "low", "high", "xhigh", "max":
+		return e
+	case "medium":
+		return "high" // DeepSeek has no medium tier
+	default:
+		return ""
+	}
+}
+
+// budgetToEffort buckets a thinking budget into an effort tier, mirroring
+// Claude Code's /effort mapping. Thresholds are forgiving to absorb drift
+// between CC versions.
+func budgetToEffort(budget int) string {
+	switch {
+	case budget <= 2048:
+		return "low"
+	case budget <= 12288:
+		return "medium"
+	case budget <= 24576:
+		return "high"
+	case budget <= 49152:
+		return "xhigh"
+	default:
+		return "max"
+	}
 }
 
 // --- Translation functions ---
@@ -565,7 +636,8 @@ func buildChatRequestFromAnthropic(req messagesRequest, backendModel string) (ma
 		slog.Debug("dropping top_k (no OpenAI equivalent)", "top_k", *req.TopK)
 	}
 
-	// thinking config: dropped for Chat Completions backends.
+	// thinking config: translated and injected per-backend by applyThinkingConfig
+	// (called from messages.go where the *config.ModelConfig is available).
 	if len(req.Thinking) > 0 && string(req.Thinking) != "null" {
 		slog.Debug("dropping thinking config for translated request")
 	}
@@ -588,6 +660,54 @@ func buildChatRequestFromAnthropic(req messagesRequest, backendModel string) (ma
 		"max_tokens", req.MaxTokens)
 
 	return chatReq, nil
+}
+
+// applyThinkingConfig injects the client's reasoning effort / thinking mode
+// into a translated Chat Completions request, per backend type.
+//
+//   - Backends that understand the DeepSeek `thinking` parameter (official
+//     deepseek-v4-flash / deepseek-v4-pro, matched by name, or any model with
+//     `thinking_passthrough: true`) get the DeepSeek-specific `thinking`
+//     switch plus the OpenAI-standard `reasoning_effort` field.
+//   - All other OpenAI-compatible backends get only `reasoning_effort`, the
+//     OpenAI-standard field, which they either honor or ignore — never the
+//     DeepSeek-only `thinking` key, which unknown backends reject with 400.
+//
+// If the client sent no effort/thinking, reasoning_effort is left unset and
+// the backend's own default applies. A top-level reasoning_effort the client
+// sent wins over a thinking block. Disabled thinking becomes thinking:
+// {type:"disabled"} for DeepSeek-compatible backends (its documented
+// off-switch); other backends get no field.
+func applyThinkingConfig(chatReq map[string]any, model *config.ModelConfig, req messagesRequest) {
+	effort, enabled := effortFromClient(req)
+	effort = normalizeEffort(effort) // collapse unknown/medium before matching
+
+	if model.SupportsDeepSeekThinking() {
+		// DeepSeek: inject both the thinking switch and reasoning_effort.
+		// Disabling thinking is expressed purely via thinking:{type:"disabled"}
+		// (reasoning_effort only accepts low/high/xhigh/max on DeepSeek).
+		if !enabled {
+			chatReq["thinking"] = map[string]any{"type": "disabled"}
+			slog.Debug("applied thinking config", "model", model.Name, "thinking", "disabled")
+			return
+		}
+		chatReq["thinking"] = map[string]any{"type": "enabled"}
+		if effort != "" {
+			chatReq["reasoning_effort"] = effort
+			slog.Debug("applied thinking config", "model", model.Name, "reasoning_effort", effort)
+		} else {
+			slog.Debug("applied thinking config", "model", model.Name, "thinking", "enabled", "reasoning_effort", "unset")
+		}
+		return
+	}
+
+	// Non-DeepSeek OpenAI-compatible backends: reasoning_effort only.
+	if enabled && effort != "" {
+		chatReq["reasoning_effort"] = effort
+		slog.Debug("applied reasoning effort", "model", model.Name, "reasoning_effort", effort)
+	} else if !enabled {
+		slog.Debug("thinking disabled, no reasoning field for non-deepseek backend", "model", model.Name)
+	}
 }
 
 // mapFinishToStopReason maps OpenAI finish_reason to Anthropic stop_reason.

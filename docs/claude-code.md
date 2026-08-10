@@ -119,6 +119,27 @@ Set `*_SUPPORTED_CAPABILITIES` to `"thinking,interleaved_thinking"` so Claude Co
 
 For **native Anthropic backends**: real extended thinking with cryptographic signatures works normally through passthrough.
 
+### Effort control for translated backends
+
+Claude Code's `/effort` command (and the `thinking.budget_tokens` it sends) is honored by the proxy for translated backends that understand the DeepSeek thinking protocol:
+
+- **Official DeepSeek models** (`deepseek-v4-flash` / `deepseek-v4-pro`) get the full injection automatically: the proxy maps the client's `thinking` budget to `reasoning_effort` and forwards `thinking: {type: enabled/disabled}` to the backend.
+- **Third-party DeepSeek-compatible gateways** (e.g. a gateway in front of a DeepSeek model) get the same full injection when the model sets `thinking_passthrough: true` in the proxy config — see [config-reference.md](config-reference.md).
+
+The client's effort maps to DeepSeek's tiers as follows (Claude Code `medium` collapses to `high`, since DeepSeek has no medium tier):
+
+| Claude Code effort | `budget_tokens` | DeepSeek `reasoning_effort` |
+|---|---|---|
+| low | 1024 | low |
+| medium | 8192 | high |
+| high | 20480 | high |
+| xhigh | 32768 | xhigh |
+| max | 64000 | max |
+
+For **other OpenAI-compatible backends** that don't support the DeepSeek `thinking` key, the proxy forwards only the OpenAI-standard `reasoning_effort` field — which they either honor or ignore — and never sends the DeepSeek-only `thinking` parameter.
+
+**Note:** If you use a Claude Code optimizer that injects `thinking: {type: "adaptive"}` (no fixed budget), the proxy maps it conservatively to `high` (DeepSeek's default), since the effort cannot be determined from a dynamic budget.
+
 ## Web search
 
 Claude Code's built-in `WebSearch` tool (`web_search_20250305`) is an Anthropic server-side feature. It works with native Anthropic backends through passthrough.
@@ -177,12 +198,51 @@ models:
     api_key: sk-ant-...
 ```
 
+## Recommended hybrid setup
+
+A common pattern is to keep the **default slots on translated, text-only backends** (cheap, controllable, images/PDFs handled by the vision processor) while reserving **one slot for a native Anthropic multimodal backend** (e.g. an Anthropic-compatible vision model served by a gateway like Alibaba Cloud Bailian MaaS) for tasks that genuinely need the model to *see* the image itself.
+
+```yaml
+models:
+  # Default slots: text-only LLM + vision processor handles images/PDFs
+  - name: MiniMax-M2.5
+    backend: http://192.168.100.10:8000/v1
+
+  # "Multimodal" slot: native Anthropic backend, full-fidelity passthrough.
+  # Pick this slot only when the raw image matters (charts, diagrams, mixed
+  # text+image reasoning) — the translation path's description loses nuance.
+  - name: qwen3.7-plus
+    backend: https://ws-<...>.maas.aliyuncs.com/apps/anthropic
+    type: anthropic
+    api_key: sk-...
+```
+
+Client side (Claude Code / CC switch):
+
+```
+ANTHROPIC_DEFAULT_SONNET_MODEL="MiniMax-M2.5"   # text-only + vision pipeline
+ANTHROPIC_DEFAULT_OPUS_MODEL="MiniMax-M2.5"
+ANTHROPIC_DEFAULT_HAIKU_MODEL="MiniMax-M2.5"
+ANTHROPIC_DEFAULT_<FABLE>_MODEL="qwen3.7-plus"  # native multimodal, on demand
+```
+
+What the hybrid buys you:
+
+- **Default work stays cheap**: text-only backends get images/PDFs via the vision processor pipeline — no per-request multimodal cost.
+- **Multimodal fidelity on demand**: the native slot passes the raw request through untouched, so the model sees original images and you get real thinking signatures and real prompt caching (if the backend implements the Anthropic protocol faithfully) instead of the translation path's placeholder signatures.
+- **Slots are independent**: each slot maps to its own model; switching does not affect the others.
+
+Notes:
+
+- `type: anthropic` backends skip the pipeline entirely unless `force_pipeline: true` is set, so nothing in the request is rewritten or cropped. A PDF sent to the native slot passes through as an Anthropic `document` block — use that slot only if the backend handles documents/images natively.
+- `DISABLE_PROMPT_CACHING` is a global Claude Code env var, not per-slot. If set to `"1"` for the translated slots, it also disables caching for the native slot. Remove it if you want the native backend to receive `cache_control` markers (harmless for translated backends, which ignore them).
+
 ## Known limitations (translated backends)
 
 - **Extended thinking**: Reasoning tokens from the backend are displayed as thinking blocks, but they don't have real Anthropic signatures. This is cosmetic — tool calling and agentic behavior work normally.
 - **Prompt caching**: Stripped silently. All translated requests are uncached.
 - **Server-side web search**: Not available directly, but the proxy can execute web searches via Tavily when `web_search_key` is configured in the `processors` block. Alternatively, use Tavily MCP.
 - **Image support**: Text-only models work with images when a vision processor is configured. Otherwise, the proxy returns a clear error with configuration guidance.
-- **PDF support**: The proxy can extract text from PDFs for text-only backends when a vision processor is configured (vision fallback for scanned PDFs).
+- **PDF support**: The proxy extracts PDFs via the **MinerU cloud API** (`processors.mineru_api_key`) — structure-preserving markdown with embedded images described by the vision model — so PDFs work for text-only backends. Without a MinerU key, PDF blocks become a failure placeholder.
 
 Native Anthropic backends have full fidelity — all features work through passthrough. Use `force_pipeline: true` on an Anthropic model to override and use proxy-side processing instead.

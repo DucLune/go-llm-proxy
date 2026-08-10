@@ -44,7 +44,9 @@ models:
 
 ### Per-model sampling defaults
 
-The `defaults` block sets sampling parameters that are injected when the client doesn't send its own. Coding assistants (Claude Code, Codex, Cursor, etc.) send their own parameters and are unaffected.
+The `defaults` block sets sampling parameters that are injected into **OpenAI Chat Completions** requests (`/v1/chat/completions`) when the client doesn't send its own. Coding assistants (Claude Code, Codex, Cursor, etc.) send their own parameters and are unaffected.
+
+> **Applies to OpenAI Chat Completions only.** Anthropic Messages requests (`/v1/messages`, what Claude Code sends) do **not** go through the defaults injection — they are translated by `buildChatRequestFromAnthropic`, which never calls `ApplySamplingDefaults`. So on the Claude Code path, `max_new_tokens` (and the rest of `defaults`) has **no effect**: the effective output cap comes from the `max_tokens` the client sends (mapped to `max_completion_tokens`), falling back to the backend's own default if the client omits it.
 
 ```yaml
 models:
@@ -65,7 +67,7 @@ models:
 | `temperature` | float | Controls randomness (0.0 = deterministic) |
 | `top_p` | float | Nucleus sampling threshold |
 | `top_k` | int | Limits vocabulary to top K tokens |
-| `max_new_tokens` | int | Maximum tokens to generate (maps to `max_tokens`) |
+| `max_new_tokens` | int | Maximum tokens to generate (maps to `max_tokens`). Only injected when the request has no `max_tokens`, and only on OpenAI Chat Completions paths — see note above. |
 | `frequency_penalty` | float | Penalizes repeated tokens by frequency (0.0–2.0) |
 | `presence_penalty` | float | Penalizes tokens that have appeared at all (0.0–2.0) |
 | `reasoning_effort` | string | Thinking budget: `low`, `medium`, or `high` |
@@ -78,19 +80,27 @@ The `processors` block configures the proxy's content processing pipeline. This 
 ```yaml
 processors:
   vision: Qwen3-VL-8B           # model name for vision processing (must be in models list)
-  ocr: PaddleOCR-VL-1.5         # fast model for PDF/document text extraction (falls back to vision)
+  ocr: PaddleOCR-VL-1.5         # fast model for image/text extraction from tool images (falls back to vision)
   web_search_key: tvly-...      # Tavily API key for web search
   vision_max_tokens: 1000       # optional: cap description length per image (0 = built-in 1000/2000 per role)
   max_images_per_request: 30    # optional: max unique images processed per request
+  mineru_api_key: your-key      # optional: MinerU cloud API token — enables PDF extraction
+  mineru_model_version: pipeline # optional: "pipeline" (default) or "vlm"
+  mineru_timeout_sec: 300       # optional: overall PDF extraction timeout in seconds
+  mineru_download_retries: 1    # optional: result-zip download retries on transient network errors
 ```
 
 | Field | Default | Description |
 |---|---|---|
 | `vision` | — | Model name to use for describing images sent to text-only backends. Must be a vision-capable model defined in `models`. |
-| `ocr` | — | Model name for OCR/text extraction from PDF page images. Use a fast, lightweight vision model here. Falls back to `vision` if not set. |
+| `ocr` | — | Model name for OCR/text extraction from tool-output page images (`view_image` results, screenshots). Use a fast, lightweight vision model here. Falls back to `vision` if not set. Not used for PDF extraction (see `mineru_api_key`). |
 | `web_search_key` | — | Search API key. Supports [Tavily](https://tavily.com/) (`tvly-...`) and [Brave Search](https://brave.com/search/api/) (`BSA...`) — provider is auto-detected from the key prefix. When set, the proxy executes web searches on behalf of clients (Claude Code, Codex) transparently. |
 | `vision_max_tokens` | `0` | Cap on the description length the vision model may produce per image. `0` = built-in defaults (1000 for user images, 2000 for tool/PDF images). Raise this to stop long or error-dense screenshots from being truncated mid-description. |
 | `max_images_per_request` | `10` | Maximum number of unique images the vision pipeline will process in a single request. Additional images are replaced with a placeholder. Claude Code replays full conversation history on every request, so long conversations accumulate images — raise this if images beyond the cap keep being dropped. |
+| `mineru_api_key` | — | Bearer token for the [MinerU cloud API](https://mineru.net/apiManage/docs) (mineru.net). When set, PDFs are extracted via MinerU (structure-preserving markdown + cropped-image descriptions). When empty, PDF content blocks are replaced with a failure placeholder. |
+| `mineru_model_version` | `pipeline` | MinerU extraction backend: `pipeline` (fast, default) or `vlm` (slower, higher accuracy on complex layouts). VLM mode costs more per parse. |
+| `mineru_timeout_sec` | `300` | Overall timeout for a single PDF extraction (submit → upload → poll → download), in seconds. |
+| `mineru_download_retries` | `1` | How many times the result-zip download is retried on transient network errors (connection/TLS failure, HTTP 5xx). HTTP 4xx (e.g. expired signed URL) is not retried. 0 = 1 retry (2 attempts total). |
 
 ### Per-model processor overrides
 
@@ -120,7 +130,30 @@ models:
 |---|---|---|
 | `supports_vision` | `false` | Set to `true` if the model handles images natively. Skips vision processing. |
 | `force_pipeline` | `false` | Run the pipeline even on native Anthropic backends. Use to force Tavily search instead of Anthropic's server-side search, or to test pipeline processing. |
+| `thinking_passthrough` | `false` | Set to `true` if the backend understands the DeepSeek-specific `thinking` parameter (`thinking: {type: enabled/disabled}`) plus the OpenAI-standard `reasoning_effort`. Only official DeepSeek models (`deepseek-v4-flash` / `deepseek-v4-pro`) get this implicitly; third-party gateways that faithfully forward DeepSeek's thinking protocol opt in explicitly with this flag. Without it, a translated backend receives only `reasoning_effort` — never the DeepSeek-only `thinking` key. |
 | `processors` | — | Per-model processor overrides. Set `vision: none` to disable, or `vision: other-model` to use a specific processor. Same for `ocr`. |
+
+### Thinking effort control (translated backends)
+
+Claude Code and other Anthropic-protocol clients control reasoning effort via the `thinking` parameter (`thinking: {type: enabled/disabled, budget_tokens: N}`). When the proxy translates a request to Chat Completions, it maps that effort onto the backend's reasoning controls — but how far it goes depends on the backend:
+
+| Backend | Injected fields |
+|---|---|
+| Official DeepSeek (`deepseek-v4-flash` / `deepseek-v4-pro`, matched by name) | `thinking: {type: enabled/disabled}` **and** `reasoning_effort` |
+| Any model with `thinking_passthrough: true` | `thinking: {type: enabled/disabled}` **and** `reasoning_effort` |
+| All other OpenAI-compatible backends | `reasoning_effort` only — never the DeepSeek-only `thinking` key |
+
+The client's effort → `reasoning_effort` mapping (Claude Code `medium` collapses to `high`; `adaptive` with no fixed budget maps conservatively to `high`):
+
+| Client effort | `budget_tokens` | `reasoning_effort` |
+|---|---|---|
+| low | 1024 | low |
+| medium | 8192 | high |
+| high | 20480 | high |
+| xhigh | 32768 | xhigh |
+| max | 64000 | max |
+
+This applies only to the **translated** Messages path. Native Anthropic backends (`type: anthropic`) pass the `thinking` parameter through untouched — the backend parses it directly, so no proxy mapping is needed.
 
 ### How it works
 

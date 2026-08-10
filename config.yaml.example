@@ -23,9 +23,12 @@ models:
     # supports_vision: false         # set true if the model handles images natively
     # responses_mode: auto           # auto | native | translate (for Codex CLI)
     # messages_mode: auto            # auto | native | translate (for Claude Code)
-    # defaults:                      # injected when the client doesn't send its own
-    #   temperature: 0.7
-    #   max_new_tokens: 4096
+    # thinking_passthrough: false    # set true for third-party DeepSeek-compatible gateways:
+    #                                #   injects DeepSeek's `thinking` + `reasoning_effort`.
+    #                                #   Official deepseek-v4-flash/pro get this implicitly.
+    # defaults:                      # injected into OpenAI Chat Completions when the client doesn't send its own.
+    #   temperature: 0.7             #   NOTE: Anthropic Messages requests (/v1/messages, Claude Code) skip defaults
+    #   max_new_tokens: 4096         #   entirely — the effective output cap there is the client's max_tokens.
     #   frequency_penalty: 0.3       # prevents repetition loops (0.0–2.0)
     #   presence_penalty: 0.0        # encourages topic diversity (0.0–2.0)
     #   reasoning_effort: medium     # thinking budget: low | medium | high
@@ -73,10 +76,14 @@ models:
 # Optional. Handles images, PDFs, and web search for backends that don't support them.
 # processors:
 #   vision: my-vision-model          # model name from above (must support vision)
-#   ocr: my-fast-ocr-model           # optional: fast model for PDF page text extraction (falls back to vision)
+#   ocr: my-fast-ocr-model           # optional: fast model for tool-output page images (falls back to vision)
 #   web_search_key: tvly-...         # Tavily API key — enables proxy-side web search
 #   vision_max_tokens: 1000          # optional: cap description length (0 = built-in 1000/2000 per role)
 #   max_images_per_request: 10       # optional: max unique images processed per request (0 = built-in default 10)
+#   mineru_api_key: your-mineru-key  # optional: MinerU cloud API token — enables PDF extraction (mineru.net)
+#   mineru_model_version: pipeline   # optional: "pipeline" (default) or "vlm"
+#   mineru_timeout_sec: 300          # optional: overall PDF extraction timeout in seconds (default: 300)
+#   mineru_download_retries: 1       # optional: result-zip download retries on transient network errors (default: 1)
 
 # ── API Keys ───────────────────────────────────────────────────────────────────
 # Clients authenticate with these keys via Authorization: Bearer or x-api-key.

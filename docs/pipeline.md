@@ -7,28 +7,14 @@ go-llm-proxy includes a content processing pipeline that transparently handles i
 ```yaml
 processors:
   vision: Qwen3-VL-8B           # vision-capable model for image description
-  ocr: paddleOCR                # dedicated OCR model for text extraction (optional)
+  ocr: paddleOCR                # dedicated OCR model for tool-output page images (optional)
   web_search_key: tvly-...      # Tavily API key for web search (optional)
+  mineru_api_key: your-key      # MinerU cloud API token — enables PDF extraction
 ```
 
-The `vision` model is required for image processing. The `ocr` model is optional — if not configured, the vision model handles OCR duties as a fallback. See [config-reference.md](config-reference.md) for per-model overrides and additional options.
+The `vision` model is required for image processing. The `ocr` model is optional — if not configured, the vision model handles OCR duties as a fallback. PDF extraction requires `mineru_api_key` (see [PDF processing](#pdf-processing) below). See [config-reference.md](config-reference.md) for per-model overrides and additional options.
 
-### System dependencies
-
-For optimal scanned-PDF processing, the host (or Docker container) should have one of:
-
-- **`poppler-utils`** (preferred) — provides `pdftoppm`, fast and purpose-built for PDF rendering
-- **`ghostscript`** — provides `gs`, widely available alternative
-
-```bash
-# Ubuntu/Debian
-sudo apt install poppler-utils
-
-# Alpine (Docker)
-apk add --no-cache poppler-utils
-```
-
-The proxy uses these to rasterize scanned PDFs into PNG pages before sending them to the dedicated OCR model (e.g., paddleOCR-VL). Without a rasterizer, scanned PDFs fall through to the vision model with the raw PDF bytes — still functional but slower and dependent on the vision model accepting PDF input directly. The proxy logs `"PDF rasterization unavailable or failed, skipping OCR stage"` when no rasterizer is found.
+No system dependencies are required for PDF processing — extraction runs through the MinerU cloud API, so the host needs neither poppler-utils nor ghostscript. (Rasterizer tools are no longer used by the proxy since the local OCR-rasterization cascade was replaced.)
 
 ## Image processing
 
@@ -43,7 +29,7 @@ When a client sends an image to a text-only backend, the proxy intercepts the im
 
 User-attached photos receive only vision description — dedicated OCR models produce unreliable output on natural photographs. Text visible in photos is captured adequately by the vision model's description.
 
-Tool output images (PDF page renders, screenshots, Codex `view_image` results) first go to the dedicated OCR model. If OCR returns empty, errors, or the `ocr` model is unavailable, the proxy automatically retries via the `vision` model. When the operator has configured only one processor, the pipeline detects the overlap and avoids duplicate calls to the same backend.
+Tool output images (Codex `view_image` results, screenshots) first go to the dedicated OCR model. If OCR returns empty, errors, or the `ocr` model is unavailable, the proxy automatically retries via the `vision` model. When the operator has configured only one processor, the pipeline detects the overlap and avoids duplicate calls to the same backend.
 
 ### Output format
 
@@ -51,7 +37,7 @@ Injected content is wrapped in XML-like tags so target models clearly distinguis
 
 - `<image_description>...</image_description>` — user-role vision description
 - `<page_text>...</page_text>` — tool-role OCR/vision extraction
-- `<pdf_content filename="..." source="text|ocr|vision">...</pdf_content>` — PDF extraction (see below)
+- `<pdf_content filename="..." source="mineru">...</pdf_content>` — PDF extraction (see below)
 
 ### Processing details
 
@@ -65,48 +51,42 @@ Injected content is wrapped in XML-like tags so target models clearly distinguis
 
 ## PDF processing
 
-PDF handling depends on the client and the PDF content type.
+PDF content is extracted through the [MinerU cloud API](https://mineru.net/apiManage/docs) (structure-preserving document parsing) plus the vision model for embedded images. This is the **only** PDF path — the old local text/OCR/vision cascade was removed.
 
-### Claude Code (Anthropic Messages API)
+Requires `processors.mineru_api_key`. Without it, every PDF block is replaced with `[PDF: MinerU processing failed — mineru_api_key not configured]` and an error is logged. If the MinerU API is unreachable, the proxy substitutes a placeholder and opens a circuit breaker so repeated requests fail fast instead of hammering the cloud API.
 
-Claude Code sends PDF content as base64 `document` blocks. The proxy handles them in a three-stage cascade:
+### How PDF extraction works
 
-| Stage | Condition | Action |
-|---|---|---|
-| **Stage 1: Text extraction** | Always attempted | Pure Go text extraction via `ledongthuc/pdf`. Fast, accurate for native PDFs. If ≥ 50 characters of plain text are recovered, subsequent stages are skipped. |
-| **Stage 2: OCR model** | Stage 1 returned too little text (scanned/image PDF) | Send PDF to the configured `ocr` model. On HTTP error or empty response, fall through to Stage 3. |
-| **Stage 3: Vision fallback** | Stage 2 failed or the only processor configured is `vision` | Send PDF to the configured `vision` model with the verbose extraction prompt. Covers scanned PDFs that dedicated OCR backends reject (e.g., paddleOCR does not accept `data:application/pdf` input). |
+For each PDF block the proxy:
 
-The injected text block is tagged `<pdf_content filename="..." source="text|ocr|vision">...</pdf_content>` — the `source` attribute identifies which stage produced the content, so downstream logs and debugging sessions can see the pipeline decision without replaying it.
+1. **Submits** the PDF to MinerU (`POST /api/v4/file-urls/batch` → `PUT` the signed upload URL → poll `GET /api/v4/extract-results/batch/{id}` until `done` → download the result zip)
+2. **Describes embedded images**: MinerU crops figures and tables to `images/*.jpg`; the proxy sends each cropped image to the `vision` model (see [Image processing](#image-processing)) and replaces the markdown `![](images/...)` reference with the description, prefixed by MinerU's caption when present (`[图: caption]\n<description>`). The image descriptions run **concurrently** (up to 5 in parallel, the same cap as user images) so figure-heavy PDFs aren't serialized into minutes of vision calls — a 19-figure PDF drops from ~10-15 min serial to ~3 min concurrent
+3. **Wraps the result** in `<pdf_content filename="..." source="mineru">...</pdf_content>` and caches it by content hash
 
-Successful extractions are cached permanently (keyed on the PDF's content hash). Total failures are cached for 5 minutes so a broken upstream doesn't permanently block a document but a misconfigured client can't trigger repeated cascade attempts every turn.
+The `source="mineru"` attribute identifies the extraction path so downstream logs and debugging sessions can see it without replaying the call.
 
-### Chat Completions API (any client)
+### Failure behavior
 
-OpenAI Chat Completions has no standard PDF input shape, but clients often submit PDFs as `image_url` with a `data:application/pdf;base64,...` URL. The proxy normalizes these into the same `pdf_data` block Anthropic produces, so Chat Completions clients go through the exact same three-stage cascade as Claude Code — no client-side changes required.
+MinerU failures are **not** silently swallowed:
 
-### Codex CLI (Responses API)
+- The PDF block is replaced with `[PDF: MinerU processing failed — <reason>]` — no fallback to the old extraction cascade
+- An `ERROR`-level log line (`mineru PDF processing failed`) is emitted with filename, error, and byte count
+- A circuit breaker opens after 10 consecutive failures (30s cooldown), after which PDF requests short-circuit to the placeholder instead of waiting for the full cloud timeout
+- Failed results are cached for 5 minutes so a broken upstream doesn't permanently block a document but a misconfigured client can't retrigger it every turn
+- The result-zip **download is retried** on transient network errors (connection/TLS failure, HTTP 5xx) — `processors.mineru_download_retries`, default 1 (2 attempts total). HTTP 4xx (e.g. an expired signed URL) is not retried; the URL won't become valid on a second attempt
 
-Codex typically handles PDFs **client-side** using local shell tools:
+### Client entry points
 
-1. Codex tries `pdftotext` for text extraction
-2. If that fails (scanned PDF), Codex extracts page images with `pdfimages`
-3. Codex calls `view_image` on each page image
-4. The proxy processes each `view_image` result through the **tool-role image cascade** (OCR first, vision fallback on failure)
-
-The proxy's role is step 4. When Codex instead submits a PDF directly as an `input_image` with a `data:application/pdf` URL — seen in some third-party integrations — the Responses-API translator converts it to a `pdf_data` block so the full three-stage cascade runs on the proxy side.
-
-### OpenCode / Qwen Code
-
-These clients handle PDFs entirely client-side. The proxy's PDF pipeline runs for direct Chat Completions requests if the request body contains PDF content signatures, but these clients typically use their own file handling tools.
+| Client | How PDFs reach the pipeline |
+|---|---|
+| **Claude Code** (Anthropic) | Sends base64 `document` blocks → translated to `pdf_data` → MinerU extraction |
+| **Chat Completions** | PDFs submitted as `image_url` with a `data:application/pdf;base64,...` URL are normalized to `pdf_data` → same MinerU path |
+| **Codex CLI** | Typically handles PDFs client-side (`pdftotext`, then `pdfimages` + `view_image` per page, processed through the tool-role image cascade). If a PDF is submitted directly as `input_image` with a `data:application/pdf` URL, the Responses translator converts it to `pdf_data` → MinerU path |
+| **OpenCode / Qwen Code** | Handle PDFs entirely client-side; the proxy's MinerU path runs only for direct requests containing PDF signatures |
 
 ### Supported PDF types
 
-| PDF type | Claude Code / Chat Completions | Codex CLI |
-|---|---|---|
-| **Native text PDF** | Stage 1: proxy extracts text | Client: `pdftotext` extracts text |
-| **Scanned/image PDF** | Stage 2 OCR → Stage 3 vision cascade | Client extracts images → proxy OCR → vision cascade per page |
-| **Mixed PDF** (text + scanned pages) | Stage 1 for text pages, Stages 2/3 for scanned pages | Client handles both paths |
+MinerU extracts structure from all of them — native-text, scanned/image, and mixed PDFs. Text pages yield clean markdown; scanned pages go through MinerU's OCR; figures/tables are cropped and described by the vision model. Per-page quality depends on the `mineru_model_version` (`pipeline` = fast, `vlm` = slower but more accurate).
 
 ## Web search
 
@@ -136,8 +116,8 @@ The proxy auto-detects the search provider from the `web_search_key` prefix:
 
 | Role | Recommended | Parameters | Notes |
 |---|---|---|---|
-| **Vision** | [Qwen3-VL-8B](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) | 8B | Best quality/speed balance for image description |
-| **OCR** | [PaddleOCR-VL-1.5](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5) | 0.9B | Purpose-built for document parsing, 94.5% accuracy, ~2s/page |
+| **Vision** | [Qwen3-VL-8B](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) | 8B | Best quality/speed balance for image description (user images, MinerU cropped figures) |
+| **OCR** | [PaddleOCR-VL-1.5](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5) | 0.9B | Purpose-built for text extraction from tool-output page images (`view_image`), 94.5% accuracy, ~2s/page. Not used for PDFs (those go through MinerU) |
 | **OCR (alt)** | [DeepSeek-OCR 2](https://huggingface.co/deepseek-ai/DeepSeek-OCR) | 3B | Higher accuracy (97%), layout analysis, table extraction |
 
 ## Caching
@@ -145,8 +125,8 @@ The proxy auto-detects the search provider from the `web_search_key` prefix:
 All pipeline results are cached by content hash for the lifetime of the proxy process:
 
 - **Image descriptions**: cached per image URL hash + mode (`:v` or `:o`)
-- **PDF text extraction**: cached per PDF content hash
-- **Vision model OCR fallback**: cached per PDF content hash
+- **PDF extraction** (MinerU markdown + image descriptions): cached per PDF content hash
+- **PDF failures** (placeholder): cached per PDF content hash with a 5-minute TTL
 
 Cache is in-memory only and resets on proxy restart. It is bounded to **1024 entries** per cache; when full, the least-recently-used entry is evicted to make room (no wholesale flush). This keeps memory bounded while preserving recent descriptions — historical images stay warm across turns instead of forcing the vision model to re-describe them every time Claude Code replays conversation history.
 
@@ -158,7 +138,7 @@ Client request
   → Translate to Chat Completions (if needed)
   → Pipeline: describe images (vision model)
   → Pipeline: OCR tool-output images (OCR model)
-  → Pipeline: extract PDF text / OCR scanned pages
+  → Pipeline: extract PDFs via MinerU + describe embedded images
   → Pipeline: inject web search function tool
   → Send to backend
   → Pipeline: execute web search if called, re-send with results

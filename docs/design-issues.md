@@ -160,6 +160,8 @@ chatReq, err = p.processPDFs(...)    // 再处理 PDF
 
 **影响**: 同时包含图片和 PDF 的请求，延迟叠加。实际场景中 PDF 页面图片走 OCR 路径，与用户图片走 vision 路径，互不干扰。
 
+> **更新（MinerU 集成后）：** PDF 路径现改为 MinerU 云 API 提取（单份 PDF ~10-30s）+ 裁剪图 vision 描述（每张 5-50s），与用户图片处理仍是串行。含 PDF 的请求在 `processImages` 完成后才进入 MinerU，整请求耗时被拉长。后续可让 `processPDFs` 提前启动（并行提取），或至少并行描述 MinerU 裁剪图（当前是串行逐张调用 vision，见下方 P2-13）。
+
 ---
 
 ### 9. 流式响应无总时长限制
@@ -240,3 +242,43 @@ https://api.anthropic.com/chat/completions  ← 不存在的路径
 - 视觉处理结果可以考虑持久化缓存（当前仅内存，重启丢失）
 - Pipeline 处理进度可以通过 SSE 事件通知客户端（当前只有 keepalive 注释）
 - 多视觉模型负载均衡（当前只支持单一 vision 模型配置）
+
+---
+
+## MinerU 集成引入的已知问题（2026-08 追加）
+
+以下问题在 MinerU 云 API 替换 PDF 管线的集成中被发现，记录供后续修复。
+
+### P2-13. MinerU 裁剪图描述串行
+
+**位置**: `internal/pipeline/pdf.go` — `describeMinerUImages()`
+
+**问题**: MinerU 提取完成后，对裁剪图逐张调用 vision 模型描述，**串行执行**（每张等上一张完成）。
+
+**影响**: sample.pdf 有 19 张图，单张 5-50s（取决于图复杂度），串行总耗时可达 10-15 分钟。`processImages` 对用户图片用 `maxConcurrentVision = 5` 并发，MinerU 裁剪图未复用该并发机制。
+
+> **已修复（2026-08）：** `describeMinerUImages` 改为并发 worker 池，复用 `maxConcurrentVision = 5`。安全前提：`ProcessRequest` 严格串行执行 `processImages` → `processPDFs`，两者从不同时运行，因此 MinerU 描述不会与用户图片描述叠加打满 vision 后端。结果用 `atomic.Bool` 完成标记收集，主 goroutine 只读完成槽（顺带避开 `processImages` escape 路径的潜在读写竞态）。并发测试 + 取消逃生测试覆盖。
+
+---
+
+### P2-14. MinerU 结果缓存 key 不含文件名
+
+**位置**: `internal/pipeline/pdf.go` L105
+
+**问题**: 缓存 key 仅用 `sha256(b64Data)`（PDF 内容哈希），**文件名不参与**。
+
+**影响**: 两份**内容相同但文件名不同**的 PDF 共享同一缓存条目，后提交的会用首次处理时的那份文件名（`<pdf_content filename="...">` 里的名字是第一次处理时的）。多用户/多会话场景下，文件名可能显示为其他用户提交的名字（内容一致，不影响 LLM 理解，但易造成困惑）。
+
+**建议**: 缓存值中同时记录文件名，命中时用当前请求的文件名覆盖展示；或将文件名纳入缓存 key（代价：同名同内容不共享缓存，可能增加 API 调用）。
+
+---
+
+### P2-15. MinerU cdn 下载不稳定导致偶发失败
+
+**位置**: `internal/pipeline/mineru.go` — `downloadAndExtractZip()`
+
+**问题**: MinerU 结果 zip 从 `cdn-mineru.openxlab.org.cn` 下载，实测偶发 `TLS handshake timeout` / `context deadline exceeded`（网络抖动），导致整份 PDF 处理失败。
+
+**影响**: 真实网络下 MinerU 提取偶发失败，PDF 降级为占位符。当前有熔断器 + 5 分钟失败 TTL 缓存兜底，但瞬时抖动不应触发熔断。
+
+> **已修复（2026-08）：** 下载步增加重试机制（`processors.mineru_download_retries`，默认 1，即最多 2 次尝试）。仅对**瞬时错误**重试（传输层错误、HTTP 5xx）；HTTP 4xx（如签名 URL 过期）不重试——重试也无法让 4xx 恢复。每次重试间隔 1s，整体仍受 `mineru_timeout_sec` 约束。

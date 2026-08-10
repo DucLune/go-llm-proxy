@@ -1453,126 +1453,6 @@ func TestHandleNonStreamingSearchLoop(t *testing.T) {
 	}
 }
 
-// --- PDF vision fallback tests ---
-
-func TestProcessPDFs_VisionFallback(t *testing.T) {
-	ResetPDFCache()
-	defer ResetPDFCache()
-
-	// Create a fake vision model backend.
-	visionServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"id": "v1", "model": "vision-model",
-			"choices": []map[string]any{{
-				"index": 0, "finish_reason": "stop",
-				"message": map[string]any{"role": "assistant", "content": "This PDF shows a scanned receipt."},
-			}},
-		})
-	}))
-	defer visionServer.Close()
-
-	cfg := &config.Config{
-		Processors: config.ProcessorsConfig{Vision: "vision-model"},
-		Models: []config.ModelConfig{
-			{Name: "target", Backend: "http://localhost/v1", Timeout: 30},
-			{Name: "vision-model", Backend: visionServer.URL + "/v1", Timeout: 30},
-		},
-	}
-	cs := config.NewTestConfigStore(cfg)
-	p := NewPipeline(cs, http.DefaultClient)
-	model := &cfg.Models[0]
-
-	// Create a minimal valid PDF that has no extractable text.
-	// This is just random bytes that won't parse as a valid PDF with text,
-	// triggering the vision fallback. We encode it as base64.
-	// Actually, use a minimal PDF that has no text objects.
-	minimalPDF := "%PDF-1.0\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n190\n%%EOF"
-	b64PDF := base64.StdEncoding.EncodeToString([]byte(minimalPDF))
-
-	chatReq := map[string]any{
-		"model": "target",
-		"messages": []any{
-			map[string]any{
-				"role": "user",
-				"content": []any{
-					map[string]any{"type": "pdf_data", "data": b64PDF, "filename": "receipt.pdf"},
-				},
-			},
-		},
-	}
-
-	result, err := p.ProcessRequest(context.Background(), chatReq, model)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// The PDF should be replaced with text from the vision model (or extraction).
-	msgs := result["messages"].([]any)
-	if len(msgs) == 0 {
-		t.Fatal("expected messages")
-	}
-	userMsg := msgs[0].(map[string]any)
-	content := userMsg["content"]
-	// Should contain text about the PDF (either extracted or vision-described).
-	contentStr := fmt.Sprintf("%v", content)
-	if !strings.Contains(contentStr, "PDF") && !strings.Contains(contentStr, "pdf") &&
-		!strings.Contains(contentStr, "receipt") && !strings.Contains(contentStr, "scanned") {
-		t.Fatalf("expected PDF-related content, got: %s", contentStr)
-	}
-}
-
-func TestProcessPDFs_VisionFallbackFailure(t *testing.T) {
-	ResetPDFCache()
-	defer ResetPDFCache()
-
-	// Vision model that always errors.
-	visionServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"error":"model unavailable"}`))
-	}))
-	defer visionServer.Close()
-
-	cfg := &config.Config{
-		Processors: config.ProcessorsConfig{Vision: "vision-model"},
-		Models: []config.ModelConfig{
-			{Name: "target", Backend: "http://localhost/v1", Timeout: 30},
-			{Name: "vision-model", Backend: visionServer.URL + "/v1", Timeout: 30},
-		},
-	}
-	cs := config.NewTestConfigStore(cfg)
-	p := NewPipeline(cs, http.DefaultClient)
-	model := &cfg.Models[0]
-
-	minimalPDF := "%PDF-1.0\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n190\n%%EOF"
-	b64PDF := base64.StdEncoding.EncodeToString([]byte(minimalPDF))
-
-	chatReq := map[string]any{
-		"model": "target",
-		"messages": []any{
-			map[string]any{
-				"role": "user",
-				"content": []any{
-					map[string]any{"type": "pdf_data", "data": b64PDF},
-				},
-			},
-		},
-	}
-
-	result, err := p.ProcessRequest(context.Background(), chatReq, model)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Even with vision failure, should gracefully degrade to placeholder.
-	msgs := result["messages"].([]any)
-	userMsg := msgs[0].(map[string]any)
-	contentStr := fmt.Sprintf("%v", userMsg["content"])
-	if !strings.Contains(contentStr, "PDF") && !strings.Contains(contentStr, "could not") {
-		t.Fatalf("expected graceful degradation message, got: %s", contentStr)
-	}
-}
-
 // --- Cross-API PDF normalization tests (M4) ---
 
 func TestDecodePDFDataURL_Valid(t *testing.T) {
@@ -1708,214 +1588,78 @@ func TestNormalizePDFDataURLs_Idempotent(t *testing.T) {
 	}
 }
 
-// --- PDF cascade tests (OCR → vision) ---
+// --- PDF MinerU cascade tests ---
 
-// scannedPDFStub is a PDF without extractable text, used to force Stage 2+.
+// scannedPDFStub is a PDF-like byte stub. Its content is irrelevant: the
+// MinerU mock does not parse it.
 const scannedPDFStub = "%PDF-1.0\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n190\n%%EOF"
 
-// mockProcessorServer returns a handler that counts hits and responds with
-// the given behavior: "ok" = 200 with text, "empty" = 200 with empty content,
-// "err" = 500 error.
-func mockProcessorServer(t *testing.T, behavior string, text string, hits *int) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if hits != nil {
-			*hits++
-		}
-		switch behavior {
-		case "err":
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(`{"error":"simulated"}`))
-		case "empty":
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"id": "r1", "model": "x",
-				"choices": []map[string]any{{
-					"index": 0, "finish_reason": "stop",
-					"message": map[string]any{"role": "assistant", "content": ""},
-				}},
-			})
-		default:
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"id": "r1", "model": "x",
-				"choices": []map[string]any{{
-					"index": 0, "finish_reason": "stop",
-					"message": map[string]any{"role": "assistant", "content": text},
-				}},
-			})
-		}
-	}))
-}
+// TestPDFCascade_MinerUFailure_TTLCached verifies that a MinerU failure is
+// replaced with a placeholder and that the placeholder is TTL-cached, so a
+// repeat request with the same PDF doesn't re-hit the (failing) cloud API.
+func TestPDFCascade_MinerUFailure_TTLCached(t *testing.T) {
+	ResetPDFCache()
+	ResetMineruBreaker()
+	defer ResetPDFCache()
 
-func runCascade(t *testing.T, cfg *config.Config, pdfBase64 string) (map[string]any, error) {
-	t.Helper()
+	// MinerU submit always fails.
+	hits := 0
+	mineruSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"simulated"}`))
+	}))
+	defer mineruSrv.Close()
+
+	cfg := &config.Config{
+		Processors: config.ProcessorsConfig{MineruAPIKey: "test-token"},
+		Models: []config.ModelConfig{
+			{Name: "target", Backend: "http://localhost/v1", Timeout: 30},
+		},
+	}
 	cs := config.NewTestConfigStore(cfg)
 	p := NewPipeline(cs, http.DefaultClient)
+	mc := NewMinerUClient(cfg.Processors, http.DefaultClient)
+	mc.baseURL = mineruSrv.URL
+	p.mineruClient = mc
 	model := &cfg.Models[0]
+
+	b64 := base64.StdEncoding.EncodeToString([]byte(scannedPDFStub))
 	req := map[string]any{
 		"model": "target",
 		"messages": []any{
 			map[string]any{
 				"role": "user",
 				"content": []any{
-					map[string]any{"type": "pdf_data", "data": pdfBase64, "filename": "test.pdf"},
+					map[string]any{"type": "pdf_data", "data": b64, "filename": "test.pdf"},
 				},
 			},
 		},
 	}
-	return p.ProcessRequest(context.Background(), req, model)
-}
 
-func TestPDFCascade_OCRSuccess_VisionNotCalled(t *testing.T) {
-	ResetPDFCache()
-	defer ResetPDFCache()
-
-	ocrHits, visionHits := 0, 0
-	ocrSrv := mockProcessorServer(t, "ok", "OCR extracted text here", &ocrHits)
-	defer ocrSrv.Close()
-	visionSrv := mockProcessorServer(t, "ok", "vision described", &visionHits)
-	defer visionSrv.Close()
-
-	cfg := &config.Config{
-		Processors: config.ProcessorsConfig{OCR: "ocr-model", Vision: "vision-model"},
-		Models: []config.ModelConfig{
-			{Name: "target", Backend: "http://localhost/v1", Timeout: 30},
-			{Name: "ocr-model", Backend: ocrSrv.URL + "/v1", Timeout: 30},
-			{Name: "vision-model", Backend: visionSrv.URL + "/v1", Timeout: 30},
-		},
-	}
-	b64 := base64.StdEncoding.EncodeToString([]byte(scannedPDFStub))
-	result, err := runCascade(t, cfg, b64)
+	result, err := p.ProcessRequest(context.Background(), req, model)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if ocrHits != 1 {
-		t.Fatalf("expected OCR to be called once, got %d", ocrHits)
-	}
-	if visionHits != 0 {
-		t.Fatalf("expected vision NOT to be called, got %d", visionHits)
-	}
-	msgs := result["messages"].([]any)
-	content := fmt.Sprintf("%v", msgs[0].(map[string]any)["content"])
-	if !strings.Contains(content, "OCR extracted text") {
-		t.Fatalf("expected OCR result in content, got: %s", content)
-	}
-	if !strings.Contains(content, `source="ocr"`) {
-		t.Fatalf("expected source=\"ocr\" in content, got: %s", content)
-	}
-}
-
-func TestPDFCascade_OCREmpty_VisionFallback(t *testing.T) {
-	ResetPDFCache()
-	defer ResetPDFCache()
-
-	ocrHits, visionHits := 0, 0
-	ocrSrv := mockProcessorServer(t, "empty", "", &ocrHits)
-	defer ocrSrv.Close()
-	visionSrv := mockProcessorServer(t, "ok", "vision saved the day", &visionHits)
-	defer visionSrv.Close()
-
-	cfg := &config.Config{
-		Processors: config.ProcessorsConfig{OCR: "ocr-model", Vision: "vision-model"},
-		Models: []config.ModelConfig{
-			{Name: "target", Backend: "http://localhost/v1", Timeout: 30},
-			{Name: "ocr-model", Backend: ocrSrv.URL + "/v1", Timeout: 30},
-			{Name: "vision-model", Backend: visionSrv.URL + "/v1", Timeout: 30},
-		},
-	}
-	b64 := base64.StdEncoding.EncodeToString([]byte(scannedPDFStub))
-	result, err := runCascade(t, cfg, b64)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ocrHits != 1 || visionHits != 1 {
-		t.Fatalf("expected 1 OCR + 1 vision, got ocr=%d vision=%d", ocrHits, visionHits)
 	}
 	content := fmt.Sprintf("%v", result["messages"].([]any)[0].(map[string]any)["content"])
-	if !strings.Contains(content, "vision saved") {
-		t.Fatalf("expected vision result, got: %s", content)
+	if !strings.Contains(content, "[PDF: MinerU processing failed") {
+		t.Fatalf("expected failure placeholder, got: %s", content)
 	}
-	if !strings.Contains(content, `source="vision"`) {
-		t.Fatalf("expected source=\"vision\", got: %s", content)
+	if hits != 1 {
+		t.Fatalf("expected 1 MinerU call on first request, got %d", hits)
 	}
-}
 
-func TestPDFCascade_OCRErrors_VisionFallback(t *testing.T) {
-	ResetPDFCache()
-	defer ResetPDFCache()
-
-	ocrHits, visionHits := 0, 0
-	ocrSrv := mockProcessorServer(t, "err", "", &ocrHits)
-	defer ocrSrv.Close()
-	visionSrv := mockProcessorServer(t, "ok", "vision rescued", &visionHits)
-	defer visionSrv.Close()
-
-	cfg := &config.Config{
-		Processors: config.ProcessorsConfig{OCR: "ocr-model", Vision: "vision-model"},
-		Models: []config.ModelConfig{
-			{Name: "target", Backend: "http://localhost/v1", Timeout: 30},
-			{Name: "ocr-model", Backend: ocrSrv.URL + "/v1", Timeout: 30},
-			{Name: "vision-model", Backend: visionSrv.URL + "/v1", Timeout: 30},
-		},
-	}
-	b64 := base64.StdEncoding.EncodeToString([]byte(scannedPDFStub))
-	result, err := runCascade(t, cfg, b64)
+	// Second call with the same PDF must hit the TTL-cached failure without
+	// re-invoking MinerU.
+	_, err = p.ProcessRequest(context.Background(), req, model)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ocrHits != 1 || visionHits != 1 {
-		t.Fatalf("expected 1 OCR + 1 vision, got ocr=%d vision=%d", ocrHits, visionHits)
-	}
-	content := fmt.Sprintf("%v", result["messages"].([]any)[0].(map[string]any)["content"])
-	if !strings.Contains(content, "vision rescued") {
-		t.Fatalf("expected vision result after OCR error, got: %s", content)
-	}
-}
-
-func TestPDFCascade_BothFail_TTLCached(t *testing.T) {
-	ResetPDFCache()
-	defer ResetPDFCache()
-
-	ocrHits, visionHits := 0, 0
-	ocrSrv := mockProcessorServer(t, "err", "", &ocrHits)
-	defer ocrSrv.Close()
-	visionSrv := mockProcessorServer(t, "err", "", &visionHits)
-	defer visionSrv.Close()
-
-	cfg := &config.Config{
-		Processors: config.ProcessorsConfig{OCR: "ocr-model", Vision: "vision-model"},
-		Models: []config.ModelConfig{
-			{Name: "target", Backend: "http://localhost/v1", Timeout: 30},
-			{Name: "ocr-model", Backend: ocrSrv.URL + "/v1", Timeout: 30},
-			{Name: "vision-model", Backend: visionSrv.URL + "/v1", Timeout: 30},
-		},
-	}
-	b64 := base64.StdEncoding.EncodeToString([]byte(scannedPDFStub))
-	result, err := runCascade(t, cfg, b64)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ocrHits != 1 || visionHits != 1 {
-		t.Fatalf("expected 1 OCR + 1 vision on first call, got ocr=%d vision=%d", ocrHits, visionHits)
-	}
-	content := fmt.Sprintf("%v", result["messages"].([]any)[0].(map[string]any)["content"])
-	if !strings.Contains(content, "could not be extracted") {
-		t.Fatalf("expected failure message, got: %s", content)
+	if hits != 1 {
+		t.Fatalf("expected TTL cache hit (no new MinerU call), got %d calls", hits)
 	}
 
-	// Second call with same PDF: should hit the TTL-cached failure without
-	// re-invoking either upstream.
-	_, err = runCascade(t, cfg, b64)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ocrHits != 1 || visionHits != 1 {
-		t.Fatalf("expected TTL cache hit (no new upstream calls), got ocr=%d vision=%d",
-			ocrHits, visionHits)
-	}
-
-	// Verify the cache entry has a non-zero expiresAt (TTL).
+	// Verify the cached entry has a TTL (non-zero expiresAt).
 	key := fmt.Sprintf("%x", sha256.Sum256([]byte(b64)))
 	pdfCache.mu.RLock()
 	entry, ok := pdfCache.items[key]
@@ -1925,64 +1669,6 @@ func TestPDFCascade_BothFail_TTLCached(t *testing.T) {
 	}
 	if entry.expiresAt.IsZero() {
 		t.Fatal("expected failure cache entry to have TTL (non-zero expiresAt)")
-	}
-}
-
-func TestPDFCascade_OnlyVisionConfigured_NoDuplicateCall(t *testing.T) {
-	ResetPDFCache()
-	defer ResetPDFCache()
-
-	// Only vision is configured; OCR falls back to the same model via
-	// resolveOCRProcessor. Cascade must not double-call.
-	hits := 0
-	srv := mockProcessorServer(t, "ok", "single call result", &hits)
-	defer srv.Close()
-
-	cfg := &config.Config{
-		Processors: config.ProcessorsConfig{Vision: "vision-model"},
-		Models: []config.ModelConfig{
-			{Name: "target", Backend: "http://localhost/v1", Timeout: 30},
-			{Name: "vision-model", Backend: srv.URL + "/v1", Timeout: 30},
-		},
-	}
-	b64 := base64.StdEncoding.EncodeToString([]byte(scannedPDFStub))
-	_, err := runCascade(t, cfg, b64)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hits != 1 {
-		t.Fatalf("expected exactly 1 upstream call (no dedupe miss), got %d", hits)
-	}
-}
-
-func TestPDFCascade_OnlyVisionConfigured_FailureNotDoubled(t *testing.T) {
-	ResetPDFCache()
-	defer ResetPDFCache()
-
-	// Vision fails; because OCR and vision resolve to the same model, we
-	// should stop after one failed call, not try the same backend twice.
-	hits := 0
-	srv := mockProcessorServer(t, "err", "", &hits)
-	defer srv.Close()
-
-	cfg := &config.Config{
-		Processors: config.ProcessorsConfig{Vision: "vision-model"},
-		Models: []config.ModelConfig{
-			{Name: "target", Backend: "http://localhost/v1", Timeout: 30},
-			{Name: "vision-model", Backend: srv.URL + "/v1", Timeout: 30},
-		},
-	}
-	b64 := base64.StdEncoding.EncodeToString([]byte(scannedPDFStub))
-	result, err := runCascade(t, cfg, b64)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hits != 1 {
-		t.Fatalf("expected exactly 1 upstream call, got %d", hits)
-	}
-	content := fmt.Sprintf("%v", result["messages"].([]any)[0].(map[string]any)["content"])
-	if !strings.Contains(content, "could not be extracted") {
-		t.Fatalf("expected failure placeholder, got: %s", content)
 	}
 }
 

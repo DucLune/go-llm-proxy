@@ -61,6 +61,7 @@ func (h *AdminHandler) ModelsData(w http.ResponseWriter, r *http.Request) {
 			"supports_vision":   m.SupportsVision,
 			"supports_audio":   m.SupportsAudio,
 			"force_pipeline":    m.ForcePipeline,
+			"thinking_passthrough": m.ThinkingPassthrough,
 			"responses_mode":    m.ResponsesMode,
 			"messages_mode":     m.MessagesMode,
 			"has_api_key":       m.APIKey != "",
@@ -190,6 +191,7 @@ type modelInputDTO struct {
 	SupportsVision   bool                `json:"supports_vision"`
 	SupportsAudio    bool                `json:"supports_audio"`
 	ForcePipeline    bool                `json:"force_pipeline"`
+	ThinkingPassthrough bool             `json:"thinking_passthrough"`
 	ResponsesMode    string              `json:"responses_mode"`
 	MessagesMode     string              `json:"messages_mode"`
 	APIKey           *string             `json:"api_key"`
@@ -236,6 +238,7 @@ func (d *modelInputDTO) toConfig(cfg *config.Config, originalName string) (confi
 		SupportsVision:   d.SupportsVision,
 		SupportsAudio:    d.SupportsAudio,
 		ForcePipeline:    d.ForcePipeline,
+		ThinkingPassthrough: d.ThinkingPassthrough,
 		ResponsesMode:    d.ResponsesMode,
 		MessagesMode:     d.MessagesMode,
 		Region:           d.Region,
@@ -465,6 +468,10 @@ func modelModalHTML() string {
               <input type="checkbox" id="force_pipeline" name="force_pipeline">
               <label for="force_pipeline">Force pipeline <span class="tip" tabindex="0" data-tip="Default: off. When on, runs the processing pipeline (vision/OCR/etc.) even when the backend could handle the request natively. Useful for normalizing inputs across mixed backends.">?</span></label>
             </div>
+            <div class="field checkbox-row">
+              <input type="checkbox" id="thinking_passthrough" name="thinking_passthrough">
+              <label for="thinking_passthrough">Thinking passthrough <span class="tip" tabindex="0" data-tip="Default: off. Set for third-party backends that understand DeepSeek's thinking parameter (thinking:{type:enabled/disabled} + reasoning_effort) — e.g. a gateway in front of a DeepSeek model. Official deepseek-v4-flash/pro get this implicitly.">?</span></label>
+            </div>
           </div>
         </div>
 
@@ -473,7 +480,7 @@ func modelModalHTML() string {
             <div class="field"><label>Temperature <span class="tip" tabindex="0" data-tip="Default: unset (backend decides, typically 1.0). 0 = deterministic; higher = more random. Range 0–2.">?</span></label><input type="number" name="temperature" step="0.05" min="0" max="2"></div>
             <div class="field"><label>Top-p <span class="tip" tabindex="0" data-tip="Default: unset (backend decides). Nucleus sampling threshold. Range 0–1.">?</span></label><input type="number" name="top_p" step="0.05" min="0" max="1"></div>
             <div class="field"><label>Top-k <span class="tip" tabindex="0" data-tip="Default: unset. Limit vocabulary to top K tokens. Not supported by all backends.">?</span></label><input type="number" name="top_k" step="1" min="0"></div>
-            <div class="field"><label>Max new tokens <span class="tip" tabindex="0" data-tip="Default: unset (backend default, often 4096). Maximum tokens to generate (maps to max_tokens in the upstream request).">?</span></label><input type="number" name="max_new_tokens" step="1" min="0"></div>
+            <div class="field"><label>Max new tokens <span class="tip" tabindex="0" data-tip="Default: unset (backend default, often 4096). Maximum tokens to generate (maps to max_tokens). Only injected into OpenAI Chat Completions when the client sends no max_tokens; Anthropic Messages requests (Claude Code) skip defaults entirely.">?</span></label><input type="number" name="max_new_tokens" step="1" min="0"></div>
             <div class="field"><label>Frequency penalty <span class="tip" tabindex="0" data-tip="Default: unset (0). Penalize tokens by how often they've appeared. Range 0–2.">?</span></label><input type="number" name="frequency_penalty" step="0.05" min="0" max="2"></div>
             <div class="field"><label>Presence penalty <span class="tip" tabindex="0" data-tip="Default: unset (0). Penalize tokens that appeared at all. Range 0–2.">?</span></label><input type="number" name="presence_penalty" step="0.05" min="0" max="2"></div>
             <div class="field">
@@ -619,6 +626,7 @@ function openModelModal(name){
     form.elements["supports_vision"].checked = !!m.supports_vision;
     form.elements["supports_audio"].checked = !!m.supports_audio;
     form.elements["force_pipeline"].checked = !!m.force_pipeline;
+    form.elements["thinking_passthrough"].checked = !!m.thinking_passthrough;
     form.elements["responses_mode"].value = m.responses_mode || "";
     form.elements["messages_mode"].value = m.messages_mode || "";
     form.elements["region"].value = m.region || "";
@@ -723,6 +731,7 @@ function collectForm(){
     supports_vision: form.elements["supports_vision"].checked,
     supports_audio: form.elements["supports_audio"].checked,
     force_pipeline: form.elements["force_pipeline"].checked,
+    thinking_passthrough: form.elements["thinking_passthrough"].checked,
     responses_mode: form.elements["responses_mode"].value,
     messages_mode: form.elements["messages_mode"].value,
     region: form.elements["region"].value.trim(),

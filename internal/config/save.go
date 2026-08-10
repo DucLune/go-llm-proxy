@@ -629,6 +629,9 @@ func modelConfigNode(m ModelConfig) *yaml.Node {
 	if m.ForcePipeline {
 		add("force_pipeline", boolNode(true))
 	}
+	if m.ThinkingPassthrough {
+		add("thinking_passthrough", boolNode(true))
+	}
 	if m.Region != "" {
 		add("region", stringNode(m.Region))
 	}

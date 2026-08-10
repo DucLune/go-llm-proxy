@@ -32,17 +32,35 @@ type ProcessorsConfig struct {
 	// of outbound vision calls a single (possibly history-heavy) request can
 	// trigger. 0 means "use built-in default" (10).
 	MaxImagesPerRequest int `yaml:"max_images_per_request"`
+
+	// MineruAPIKey is the Bearer token for the MinerU cloud API (mineru.net),
+	// used to extract text/structure from PDFs. Empty = PDF processing disabled;
+	// PDF content blocks are replaced with a failure placeholder.
+	MineruAPIKey string `yaml:"mineru_api_key"`
+
+	// MineruModelVersion selects the MinerU extraction backend: "pipeline"
+	// (default, fast) or "vlm" (slower but more accurate for complex layouts).
+	MineruModelVersion string `yaml:"mineru_model_version"`
+
+	// MineruTimeoutSec bounds the whole extraction (submit → upload → poll →
+	// download). 0 = 300s.
+	MineruTimeoutSec int `yaml:"mineru_timeout_sec"`
+
+	// MineruDownloadRetries is how many times the result-zip download is retried
+	// on transient network errors (connection/TLS/read timeout, 5xx). HTTP 4xx
+	// (e.g. expired signed URL) is not retried. 0 = 1 retry (2 attempts total).
+	MineruDownloadRetries int `yaml:"mineru_download_retries"`
 }
 
 // LogConfig controls file-based logging. When File is empty, logs go only to
 // stdout (preserving the original behavior). When set, slog writes to the file
 // via lumberjack (size-based rotation) as well as stdout.
 type LogConfig struct {
-	Level      string `yaml:"level"`        // "info" or "debug" (debug = -log-debug)
-	File       string `yaml:"file"`         // log file path; empty = no file logging
-	MaxSizeMB  int    `yaml:"max_size_mb"`  // max MB per log file before rotation (0 = 10)
-	MaxBackups int    `yaml:"max_backups"`  // number of old log files to keep (0 = 5)
-	Compress   *bool  `yaml:"compress"`     // gzip-compress rotated files (default true)
+	Level      string `yaml:"level"`       // "info" or "debug" (debug = -log-debug)
+	File       string `yaml:"file"`        // log file path; empty = no file logging
+	MaxSizeMB  int    `yaml:"max_size_mb"` // max MB per log file before rotation (0 = 10)
+	MaxBackups int    `yaml:"max_backups"` // number of old log files to keep (0 = 5)
+	Compress   *bool  `yaml:"compress"`    // gzip-compress rotated files (default true)
 }
 
 type Config struct {
@@ -100,8 +118,15 @@ type ModelConfig struct {
 	SupportsVision bool              `yaml:"supports_vision"` // model handles images natively
 	SupportsAudio  bool              `yaml:"supports_audio"`  // model handles audio (transcription or audio input)
 	ForcePipeline  bool              `yaml:"force_pipeline"`  // run pipeline even on native backends
-	Processors     *ProcessorsConfig `yaml:"processors"`      // per-model processor overrides (nil = use global)
-	Defaults       *SamplingDefaults `yaml:"defaults"`        // default sampling parameters (nil = use backend defaults)
+	// ThinkingPassthrough declares that this backend understands the
+	// DeepSeek-specific `thinking` parameter (thinking:{type:enabled/disabled})
+	// plus the OpenAI-standard `reasoning_effort`, so the full thinking-mode
+	// injection applies. Use for third-party gateways that faithfully forward
+	// DeepSeek's thinking protocol (e.g. a gateway in front of a DeepSeek
+	// model); the official deepseek-v4-flash/pro models enable it implicitly.
+	ThinkingPassthrough bool              `yaml:"thinking_passthrough"` // inject DeepSeek thinking param (third-party DeepSeek-compatible backends)
+	Processors          *ProcessorsConfig `yaml:"processors"`            // per-model processor overrides (nil = use global)
+	Defaults            *SamplingDefaults `yaml:"defaults"`              // default sampling parameters (nil = use backend defaults)
 
 	// AWS Bedrock fields (only used when type: "bedrock").
 	// If api_key is set, it is sent as a Bedrock API key bearer token and the
@@ -315,6 +340,28 @@ func FindModel(cfg *Config, name string) *ModelConfig {
 	return nil
 }
 
+// officialDeepSeekModels is the allowlist of models that speak the official
+// DeepSeek Chat Completions API (api.deepseek.com), which understands the
+// DeepSeek-specific `thinking` parameter alongside the OpenAI-standard
+// `reasoning_effort` field. These models get the full thinking-mode injection
+// implicitly; third-party DeepSeek-compatible gateways opt in explicitly via
+// `thinking_passthrough: true`.
+var officialDeepSeekModels = map[string]bool{
+	"deepseek-v4-flash": true,
+	"deepseek-v4-pro":   true,
+}
+
+// SupportsDeepSeekThinking reports whether the model's backend understands the
+// DeepSeek-specific `thinking` parameter, so the full thinking-mode injection
+// (thinking + reasoning_effort) should apply. True for the official DeepSeek
+// models (matched by name) or any model with `thinking_passthrough: true`
+// (third-party gateways that faithfully forward DeepSeek's thinking protocol).
+// Used by the Messages translation path to decide how much of the client's
+// effort/thinking config to forward.
+func (m *ModelConfig) SupportsDeepSeekThinking() bool {
+	return officialDeepSeekModels[m.Name] || m.ThinkingPassthrough
+}
+
 func validateConfig(cfg *Config) error {
 	if len(cfg.Keys) == 0 {
 		slog.Warn("no API keys configured — all requests will be unauthenticated")
@@ -435,6 +482,13 @@ func validateConfig(cfg *Config) error {
 		if !names[v] {
 			return fmt.Errorf("global processors.audio references unknown model %q", v)
 		}
+	}
+
+	// PDF extraction depends on the MinerU cloud API. Warn loudly at startup
+	// when it's not configured so operators know PDF blocks will degrade to a
+	// failure placeholder rather than being extracted.
+	if cfg.Processors.MineruAPIKey == "" {
+		slog.Warn("processors.mineru_api_key is not configured — PDF content will be replaced with a failure placeholder")
 	}
 
 	// Validate per-model processor overrides reference defined models.

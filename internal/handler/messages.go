@@ -142,6 +142,11 @@ func (h *MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Inject the client's thinking/effort config into the translated request,
+	// mapped per backend type (DeepSeek gets the full thinking switch, other
+	// OpenAI-compatible backends get reasoning_effort only).
+	applyThinkingConfig(chatReq, model, req)
+
 	// Run pipeline pre-send processors (vision, PDF, etc.).
 	// For streaming requests, send SSE keepalives during processing to prevent
 	// the client from timing out while the vision model describes images.
@@ -181,6 +186,11 @@ func (h *MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"model", req.Model, "key", keyName, "error", ctx.Err())
 		return
 	}
+
+	// Apply the model's default sampling parameters (e.g. defaults.reasoning_effort)
+	// to anything the client didn't set explicitly. Injected after applyThinkingConfig
+	// so an explicit client effort wins; ApplySamplingDefaults only fills gaps.
+	model.ApplySamplingDefaults(chatReq)
 
 	chatBody, err := json.Marshal(chatReq)
 	if err != nil {

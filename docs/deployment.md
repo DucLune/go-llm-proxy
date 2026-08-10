@@ -15,13 +15,9 @@ Production deployment details for go-llm-proxy.
 
 ## Optional system dependencies
 
-For scanned-PDF OCR via rasterization (recommended when using a dedicated OCR model like paddleOCR-VL):
+PDF extraction runs through the **MinerU cloud API** (`processors.mineru_api_key`), so no local rasterizer is required. The old poppler-utils/ghostscript requirement was removed when the local OCR-rasterization cascade was replaced by MinerU. See [pipeline.md](pipeline.md) for details.
 
-```bash
-sudo apt install poppler-utils   # provides pdftoppm for PDF→PNG conversion
-```
-
-Without this, scanned PDFs fall back to the vision model with raw PDF input — functional but slower. See [pipeline.md](pipeline.md) for details.
+For the tool-role image pipeline (`view_image` results, screenshots), the proxy sends images to a vision/OCR model over HTTP — no local tools needed there either.
 
 ## Binary run
 

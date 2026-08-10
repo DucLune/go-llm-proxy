@@ -34,6 +34,10 @@ type Pipeline struct {
 	// Falls back to client when nil (tests, callers that build the Pipeline
 	// without a vision client).
 	visionClient *http.Client
+	// mineruClient is the MinerU cloud client used for PDF extraction. Built
+	// lazily from the processors config on first use (so config reloads take
+	// effect); tests may pre-set it to point at a mock server.
+	mineruClient *MinerUClient
 }
 
 // NewPipeline creates a pipeline that uses the given config and HTTP client for processor calls.
@@ -199,11 +203,13 @@ func (p *Pipeline) ProcessRequest(ctx context.Context, chatReq map[string]any,
 		}
 	}
 
-	// PDF: text extraction (always attempted) with OCR/vision fallback for scanned pages.
-	// Prefers ocrModel for scanned PDFs; falls back to visionModel if no OCR model configured.
+	// PDF: text extraction via MinerU (always attempted when configured), with
+	// embedded images described by the vision model. ocrModel is preserved in
+	// the signature for processImages; MinerU extraction does not use it.
 	{
 		var err error
-		chatReq, err = p.processPDFs(ctx, chatReq, visionModel, ocrModel)
+		visionMaxTokens := cfg.Processors.VisionMaxTokens
+		chatReq, err = p.processPDFs(ctx, chatReq, visionModel, ocrModel, visionMaxTokens)
 		if err != nil {
 			slog.Warn("PDF processing error", "error", err)
 		}

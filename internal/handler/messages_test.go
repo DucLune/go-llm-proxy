@@ -602,8 +602,170 @@ func TestBuildChatRequestFromAnthropic_ThinkingDropped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	// The pure translation layer never injects thinking config — that happens
+	// later in applyThinkingConfig (messages.go), where the *config.ModelConfig
+	// and its backend type are available.
 	if _, has := chatReq["thinking"]; has {
-		t.Fatal("expected thinking config to be dropped")
+		t.Fatal("expected thinking config to be absent from translated request")
+	}
+	if _, has := chatReq["reasoning_effort"]; has {
+		t.Fatal("expected reasoning_effort to be absent from translated request")
+	}
+}
+
+// --- applyThinkingConfig tests ---
+
+func newDeepSeekModel(name string) *config.ModelConfig {
+	return &config.ModelConfig{Name: name, Model: name, Type: config.BackendOpenAI}
+}
+
+func newGenericModel(name string) *config.ModelConfig {
+	return &config.ModelConfig{Name: name, Model: name, Type: config.BackendOpenAI}
+}
+
+func TestApplyThinkingConfig_ThinkingPassthroughField(t *testing.T) {
+	// A third-party gateway with thinking_passthrough: true gets the full
+	// DeepSeek thinking injection even though its name isn't in the official list.
+	model := &config.ModelConfig{
+		Name: "ds-v4-flash-opencode", Model: "deepseek-v4-flash-free",
+		Type: config.BackendOpenAI, ThinkingPassthrough: true,
+	}
+	chatReq := map[string]any{}
+	applyThinkingConfig(chatReq, model, messagesRequest{
+		Thinking: json.RawMessage(`{"type":"enabled","budget_tokens":20480}`),
+	})
+	if th, ok := chatReq["thinking"].(map[string]any); !ok || th["type"] != "enabled" {
+		t.Fatalf("expected thinking enabled for thinking_passthrough model, got %v", chatReq["thinking"])
+	}
+	if chatReq["reasoning_effort"] != "high" {
+		t.Fatalf("expected reasoning_effort=high, got %v", chatReq["reasoning_effort"])
+	}
+
+	// Same name without the flag stays on the generic path (no thinking key).
+	plain := &config.ModelConfig{
+		Name: "ds-v4-flash-opencode", Model: "deepseek-v4-flash-free",
+		Type: config.BackendOpenAI,
+	}
+	chatReq2 := map[string]any{}
+	applyThinkingConfig(chatReq2, plain, messagesRequest{
+		Thinking: json.RawMessage(`{"type":"enabled","budget_tokens":20480}`),
+	})
+	if _, has := chatReq2["thinking"]; has {
+		t.Fatalf("expected no thinking key without thinking_passthrough, got %v", chatReq2)
+	}
+	if chatReq2["reasoning_effort"] != "high" {
+		t.Fatalf("expected reasoning_effort=high on generic path, got %v", chatReq2["reasoning_effort"])
+	}
+}
+
+func TestApplyThinkingConfig_DeepSeek_BudgetMapped(t *testing.T) {
+	model := newDeepSeekModel("deepseek-v4-flash")
+	cases := []struct {
+		thinking   string
+		wantEffort string
+		wantType   string // "disabled", "enabled", or "" (no thinking key)
+	}{
+		{`{"type":"enabled","budget_tokens":1024}`, "low", "enabled"},
+		{`{"type":"enabled","budget_tokens":8192}`, "high", "enabled"}, // medium -> high
+		{`{"type":"enabled","budget_tokens":20480}`, "high", "enabled"},
+		{`{"type":"enabled","budget_tokens":32768}`, "xhigh", "enabled"},
+		{`{"type":"enabled","budget_tokens":64000}`, "max", "enabled"},
+		{`{"type":"disabled"}`, "", "disabled"},
+		{`{"type":"adaptive"}`, "high", "enabled"},
+	}
+	for _, c := range cases {
+		chatReq := map[string]any{}
+		applyThinkingConfig(chatReq, model, messagesRequest{Thinking: json.RawMessage(c.thinking)})
+		if c.wantType == "disabled" {
+			if chatReq["thinking"] == nil || chatReq["thinking"].(map[string]any)["type"] != "disabled" {
+				t.Fatalf("%s: expected thinking disabled, got %v", c.thinking, chatReq["thinking"])
+			}
+			if _, has := chatReq["reasoning_effort"]; has {
+				t.Fatalf("%s: expected no reasoning_effort when disabled, got %v", c.thinking, chatReq["reasoning_effort"])
+			}
+			continue
+		}
+		if c.wantType == "enabled" {
+			th, ok := chatReq["thinking"].(map[string]any)
+			if !ok || th["type"] != "enabled" {
+				t.Fatalf("%s: expected thinking enabled, got %v", c.thinking, chatReq["thinking"])
+			}
+			if c.wantEffort == "" {
+				if _, has := chatReq["reasoning_effort"]; has {
+					t.Fatalf("%s: expected no reasoning_effort, got %v", c.thinking, chatReq["reasoning_effort"])
+				}
+			} else if chatReq["reasoning_effort"] != c.wantEffort {
+				t.Fatalf("%s: expected reasoning_effort=%s, got %v", c.thinking, c.wantEffort, chatReq["reasoning_effort"])
+			}
+		}
+	}
+}
+
+func TestApplyThinkingConfig_DeepSeek_NoThinking(t *testing.T) {
+	model := newDeepSeekModel("deepseek-v4-pro")
+	chatReq := map[string]any{}
+	applyThinkingConfig(chatReq, model, messagesRequest{})
+	// Client sent nothing: thinking enabled by default, reasoning_effort unset.
+	if _, has := chatReq["thinking"]; !has {
+		t.Fatal("expected thinking enabled by default for DeepSeek")
+	}
+	if _, has := chatReq["reasoning_effort"]; has {
+		t.Fatal("expected no reasoning_effort when client sent none")
+	}
+}
+
+func TestApplyThinkingConfig_DeepSeek_TopLevelEffortWins(t *testing.T) {
+	model := newDeepSeekModel("deepseek-v4-flash")
+	chatReq := map[string]any{}
+	req := messagesRequest{
+		Thinking:        json.RawMessage(`{"type":"enabled","budget_tokens":1024}`),
+		ReasoningEffort: "high",
+	}
+	applyThinkingConfig(chatReq, model, req)
+	if chatReq["reasoning_effort"] != "high" {
+		t.Fatalf("expected top-level reasoning_effort to win, got %v", chatReq["reasoning_effort"])
+	}
+}
+
+func TestApplyThinkingConfig_DeepSeek_MediumNormalized(t *testing.T) {
+	model := newDeepSeekModel("deepseek-v4-pro")
+	chatReq := map[string]any{}
+	applyThinkingConfig(chatReq, model, messagesRequest{ReasoningEffort: "medium"})
+	if chatReq["reasoning_effort"] != "high" {
+		t.Fatalf("expected medium normalized to high, got %v", chatReq["reasoning_effort"])
+	}
+}
+
+func TestApplyThinkingConfig_GenericModel_EffortOnly(t *testing.T) {
+	model := newGenericModel("sensenova-6.7-flash-lite")
+	cases := []struct {
+		req        messagesRequest
+		wantKey    string
+		wantVal    any
+	}{
+		{messagesRequest{Thinking: json.RawMessage(`{"type":"enabled","budget_tokens":20480}`)}, "reasoning_effort", "high"},
+		{messagesRequest{Thinking: json.RawMessage(`{"type":"disabled"}`)}, "", nil},
+		{messagesRequest{ReasoningEffort: "high"}, "reasoning_effort", "high"},
+		{messagesRequest{}, "", nil},
+	}
+	for _, c := range cases {
+		chatReq := map[string]any{}
+		applyThinkingConfig(chatReq, model, c.req)
+		if c.wantKey == "" {
+			if _, has := chatReq["thinking"]; has {
+				t.Fatalf("expected no thinking key for generic model, got %v", chatReq)
+			}
+			if _, has := chatReq["reasoning_effort"]; has {
+				t.Fatalf("expected no reasoning_effort for %v, got %v", c.req, chatReq)
+			}
+			continue
+		}
+		if _, has := chatReq["thinking"]; has {
+			t.Fatalf("expected no thinking key for generic model, got %v", chatReq)
+		}
+		if chatReq[c.wantKey] != c.wantVal {
+			t.Fatalf("expected %s=%v, got %v", c.wantKey, c.wantVal, chatReq[c.wantKey])
+		}
 	}
 }
 
@@ -642,6 +804,93 @@ func newTestMessagesHandler(t *testing.T, modelType string, upstream http.Handle
 	}
 	cs := config.NewTestConfigStore(cfg)
 	return NewMessagesHandler(cs, nil, nil), ts
+}
+
+func TestMessagesHandler_DeepSeekEffortInjected(t *testing.T) {
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-1", "model": "deepseek-v4-flash", "created": 0,
+			"choices": []map[string]any{{
+				"index": 0, "finish_reason": "stop",
+				"message": map[string]any{"role": "assistant", "content": "Hi"},
+			}},
+			"usage": map[string]any{"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+		})
+	}))
+	defer ts.Close()
+
+	cfg := &config.Config{
+		Models: []config.ModelConfig{{
+			Name: "deepseek-v4-flash", Backend: ts.URL + "/v1", APIKey: "backend-secret",
+			Model: "deepseek-v4-flash", Timeout: 10, Type: config.BackendOpenAI,
+		}},
+	}
+	cs := config.NewTestConfigStore(cfg)
+	handler := NewMessagesHandler(cs, nil, nil)
+
+	body := `{"model":"deepseek-v4-flash","max_tokens":100,"thinking":{"type":"enabled","budget_tokens":20480},"messages":[{"role":"user","content":"Hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	th, ok := gotBody["thinking"].(map[string]any)
+	if !ok || th["type"] != "enabled" {
+		t.Fatalf("expected thinking enabled in upstream body, got %v", gotBody["thinking"])
+	}
+	if gotBody["reasoning_effort"] != "high" {
+		t.Fatalf("expected reasoning_effort=high, got %v", gotBody["reasoning_effort"])
+	}
+}
+
+func TestMessagesHandler_GenericModelNoThinkingKey(t *testing.T) {
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-1", "model": "sensenova-6.7-flash-lite", "created": 0,
+			"choices": []map[string]any{{
+				"index": 0, "finish_reason": "stop",
+				"message": map[string]any{"role": "assistant", "content": "Hi"},
+			}},
+			"usage": map[string]any{"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+		})
+	}))
+	defer ts.Close()
+
+	cfg := &config.Config{
+		Models: []config.ModelConfig{{
+			Name: "sensenova-6.7-flash-lite", Backend: ts.URL + "/v1", APIKey: "backend-secret",
+			Model: "sensenova-6.7-flash-lite", Timeout: 10, Type: config.BackendOpenAI,
+		}},
+	}
+	cs := config.NewTestConfigStore(cfg)
+	handler := NewMessagesHandler(cs, nil, nil)
+
+	body := `{"model":"sensenova-6.7-flash-lite","max_tokens":100,"thinking":{"type":"enabled","budget_tokens":20480},"messages":[{"role":"user","content":"Hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if _, has := gotBody["thinking"]; has {
+		t.Fatalf("expected no thinking key for generic model, got %v", gotBody["thinking"])
+	}
+	if gotBody["reasoning_effort"] != "high" {
+		t.Fatalf("expected reasoning_effort=high, got %v", gotBody["reasoning_effort"])
+	}
 }
 
 func TestMessagesHandler_NonStreaming(t *testing.T) {
